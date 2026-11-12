@@ -3,15 +3,17 @@
  *
  * Two layout bugs are handled:
  *
- * 1. WeCom maps a transparent override-redirect helper window over the top
- *    edge of its main window (a client-side title bar strip) and raises it
- *    above every other window on the screen.  Because the strip has a full
- *    input shape, clicks aimed at whatever is really on top at that place are
- *    swallowed by WeCom.  The strip's input and bounding regions are trimmed
- *    by the areas that are covered by windows stacked above WeCom, so those
- *    clicks reach the window the user actually sees and the caption buttons
- *    the strip draws there stop bleeding through it, while the uncovered part
- *    of the strip keeps working as WeCom's title bar.
+ * 1. WeCom draws parts of its client-side chrome in transparent
+ *    override-redirect helper windows (the title bar strip with the
+ *    minimize/maximize/close buttons, and small widgets such as the "more"
+ *    button) and raises them above every other window on the screen.  Because
+ *    those windows have a full input shape, clicks aimed at whatever is really
+ *    on top at that place are swallowed by WeCom, and because they sit above
+ *    the windows they belong under, they bleed through dialogs.  Their input
+ *    and bounding regions are trimmed by the areas covered by windows stacked
+ *    above the WeCom window they belong to, so clicks reach the window the user
+ *    actually sees, the drawn buttons stop bleeding through dialogs, and the
+ *    uncovered part keeps working as WeCom's own chrome.
  *
  * 2. WeCom draws its drop shadow into a separate 32 bit window that is larger
  *    than the main window on every side.  During an interactive move or
@@ -21,7 +23,7 @@
  *
  * Nothing is written to the Wine prefix, the application data or any
  * configuration file.  The program only adjusts X11 window geometry and
- * input shapes; it restores the strip input shape when it exits.
+ * input shapes; it restores the original shapes when it exits.
  */
 
 #include <X11/Xatom.h>
@@ -57,6 +59,10 @@ static const char *const wecom_classes[] = {
 #define RING_PAD_MIN 2
 #define RING_PAD_MAX 40
 #define STRIP_MAX_HEIGHT 64
+#define OVERLAY_MAX_HEIGHT 64
+#define OVERLAY_SLACK 64
+#define OVERLAY_MIN_AREA 64
+#define MAX_OVERLAYS 8
 #define MAX_HOLES 64
 #define SCAN_INTERVAL_MS 10000.0
 #define SCAN_DEBOUNCE_MS 250.0
@@ -69,12 +75,26 @@ typedef struct {
     int x, y, w, h;
 } Rect;
 
+/*
+ * An override-redirect ARGB window that WeCom uses to draw part of its own
+ * chrome.  base is the window's own bounding shape (rounded corners and the
+ * like); it is kept so that shaping only ever removes pixels and so that the
+ * original shape can be restored on exit.
+ */
+typedef struct {
+    Window win;
+    XRectangle *base;
+    int base_count;
+    int seen;
+} Overlay;
+
 typedef struct {
     Window main;
     Window frame;
     Window ring;
     Window ring_frame;
-    Window strip;
+    Overlay overlays[MAX_OVERLAYS];
+    int overlay_count;
     int ring_pad;
     unsigned long pid;
     int valid;
@@ -90,6 +110,9 @@ static int shape_dirty = 1;
 static Atom atom_wm_pid;
 static Atom atom_wm_window_type;
 static Atom atom_wm_window_type_normal;
+static Atom atom_wm_window_type_popup_menu;
+static Atom atom_wm_window_type_dropdown_menu;
+static Atom atom_wm_window_type_tooltip;
 static Atom atom_client_list;
 
 static Target targets[MAX_TARGETS];
@@ -242,11 +265,29 @@ static Window win_top_level(Window win)
     return current;
 }
 
+static int win_is_known_overlay(Window win)
+{
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+
+        if (!t->valid) {
+            continue;
+        }
+        for (int j = 0; j < t->overlay_count; j++) {
+            if (t->overlays[j].win == win) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /*
- * Fill a hole list with the parts of the strip rectangle that are covered by
- * windows stacked above the WeCom frame.  Coordinates are strip-local.
+ * Fill a hole list with the parts of an overlay rectangle that are covered by
+ * windows stacked above the WeCom frame it belongs to.  Coordinates are
+ * overlay-local.
  */
-static int collect_occluders(Target *t, const Rect *strip, XRectangle *holes,
+static int collect_occluders(Target *t, const Rect *rect, XRectangle *holes,
                              int max_holes)
 {
     Window root_ret, parent_ret, *top = NULL;
@@ -270,7 +311,7 @@ static int collect_occluders(Target *t, const Rect *strip, XRectangle *holes,
         if (!above_frame) {
             continue;
         }
-        if (win == t->strip || win == t->ring_frame) {
+        if (win_is_known_overlay(win) || win == t->ring_frame) {
             continue;
         }
 
@@ -286,22 +327,22 @@ static int collect_occluders(Target *t, const Rect *strip, XRectangle *holes,
         if (!win_rect(win, &r)) {
             continue;
         }
-        int x0 = r.x > strip->x ? r.x : strip->x;
-        int y0 = r.y > strip->y ? r.y : strip->y;
-        int x1 = (r.x + r.w) < (strip->x + strip->w)
+        int x0 = r.x > rect->x ? r.x : rect->x;
+        int y0 = r.y > rect->y ? r.y : rect->y;
+        int x1 = (r.x + r.w) < (rect->x + rect->w)
                      ? (r.x + r.w)
-                     : (strip->x + strip->w);
-        int y1 = (r.y + r.h) < (strip->y + strip->h)
+                     : (rect->x + rect->w);
+        int y1 = (r.y + r.h) < (rect->y + rect->h)
                      ? (r.y + r.h)
-                     : (strip->y + strip->h);
+                     : (rect->y + rect->h);
         if (x1 <= x0 || y1 <= y0) {
             continue;
         }
         if (n >= max_holes) {
             break;
         }
-        holes[n].x = (short)(x0 - strip->x);
-        holes[n].y = (short)(y0 - strip->y);
+        holes[n].x = (short)(x0 - rect->x);
+        holes[n].y = (short)(y0 - rect->y);
         holes[n].width = (unsigned short)(x1 - x0);
         holes[n].height = (unsigned short)(y1 - y0);
         n++;
@@ -312,51 +353,62 @@ static int collect_occluders(Target *t, const Rect *strip, XRectangle *holes,
     return n;
 }
 
-static void strip_apply_shape(Target *t)
+static XserverRegion overlay_full_region(const Rect *s)
+{
+    XRectangle full;
+
+    full.x = 0;
+    full.y = 0;
+    full.width = (unsigned short)s->w;
+    full.height = (unsigned short)s->h;
+    return XFixesCreateRegion(dpy, &full, 1);
+}
+
+static XserverRegion overlay_base_region(const Overlay *o, const Rect *s)
+{
+    if (o->base_count > 0 && o->base != NULL) {
+        return XFixesCreateRegion(dpy, o->base, o->base_count);
+    }
+    return overlay_full_region(s);
+}
+
+static void overlay_apply_shape(Target *t, Overlay *o)
 {
     Rect s;
-    XRectangle full;
     XRectangle holes[MAX_HOLES];
     int nholes;
     XserverRegion region;
 
-    if (t->strip == None || !win_rect(t->strip, &s)) {
+    if (!win_rect(o->win, &s)) {
         return;
     }
-    full.x = 0;
-    full.y = 0;
-    full.width = (unsigned short)s.w;
-    full.height = (unsigned short)s.h;
-
+    region = overlay_base_region(o, &s);
     nholes = collect_occluders(t, &s, holes, MAX_HOLES);
-    region = XFixesCreateRegion(dpy, &full, 1);
     if (nholes > 0) {
         XserverRegion covered = XFixesCreateRegion(dpy, holes, nholes);
         XFixesSubtractRegion(dpy, region, region, covered);
         XFixesDestroyRegion(dpy, covered);
     }
-    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeBounding, 0, 0, region);
-    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeInput, 0, 0, region);
+    XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
+    XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
 }
 
-static void strip_restore_full(Target *t)
+static void overlay_restore(Target *t, Overlay *o)
 {
     Rect s;
-    XRectangle full;
     XserverRegion region;
 
-    if (t->strip == None || !win_rect(t->strip, &s)) {
+    (void)t;
+    if (!win_rect(o->win, &s)) {
         return;
     }
-    full.x = 0;
-    full.y = 0;
-    full.width = (unsigned short)s.w;
-    full.height = (unsigned short)s.h;
-    region = XFixesCreateRegion(dpy, &full, 1);
-    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeBounding, 0, 0, region);
-    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeInput, 0, 0, region);
+    region = overlay_base_region(o, &s);
+    XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
+    XFixesDestroyRegion(dpy, region);
+    region = overlay_full_region(&s);
+    XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
 }
@@ -392,29 +444,39 @@ static void glue_ring(Target *t)
 }
 
 /*
- * Keep the transparent strip on the top edge of the main window even while
- * Wine is still one pointer event behind.
+ * Keep the transparent title bar strip on the top edge of the main window even
+ * while Wine is still one pointer event behind.  Only strip-shaped overlays
+ * (as wide as the window, at its top edge) are moved; small widgets are
+ * positioned by WeCom itself.
  */
-static void glue_strip(Target *t)
+static void glue_overlays(Target *t)
 {
-    Rect m, s;
-    int dx, dy;
+    Rect m;
 
-    if (t->strip == None) {
+    if (!t->valid || !win_rect(t->main, &m)) {
         return;
     }
-    if (!win_rect(t->main, &m) || !win_rect(t->strip, &s)) {
-        return;
+    for (int i = 0; i < t->overlay_count; i++) {
+        Overlay *o = &t->overlays[i];
+        Rect s;
+        int dx, dy;
+
+        if (!win_rect(o->win, &s)) {
+            continue;
+        }
+        if (s.h > STRIP_MAX_HEIGHT || abs(s.w - m.w) > 64) {
+            continue;
+        }
+        dx = m.x - s.x;
+        dy = m.y - s.y;
+        if (dx > -2 && dx < 2 && dy > -2 && dy < 2 && s.w == m.w) {
+            continue;
+        }
+        XMoveResizeWindow(dpy, o->win, m.x, m.y, (unsigned)m.w,
+                          (unsigned)s.h);
+        XFlush(dpy);
+        logmsg("overlay %#lx glued (dx=%d dy=%d w=%d)", o->win, dx, dy, m.w);
     }
-    dx = m.x - s.x;
-    dy = m.y - s.y;
-    if (dx > -2 && dx < 2 && dy > -2 && dy < 2 && s.w == m.w) {
-        return;
-    }
-    XMoveResizeWindow(dpy, t->strip, m.x, m.y, (unsigned)m.w,
-                      (unsigned)s.h);
-    XFlush(dpy);
-    logmsg("strip %#lx glued (dx=%d dy=%d w=%d)", t->strip, dx, dy, m.w);
 }
 
 /*
@@ -572,84 +634,92 @@ static void find_ring(Target *t, const Rect *m)
     }
 }
 
-static int strip_still_valid(Target *t, const Rect *m)
+static int overlay_is_popup(Window win)
+{
+    return win_has_window_type(win, atom_wm_window_type_popup_menu) ||
+           win_has_window_type(win, atom_wm_window_type_dropdown_menu) ||
+           win_has_window_type(win, atom_wm_window_type_tooltip);
+}
+
+/*
+ * Small override-redirect ARGB windows of the same process are WeCom's own
+ * chrome (title bar strip, "more" button, ...).  They are matched to the
+ * window whose top right corner they sit closest to, because WeCom anchors
+ * them at their owner's top edge.
+ */
+static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
+                                const Rect *r)
 {
     XWindowAttributes attr;
-    Rect r;
 
-    if (t->strip == None || !XGetWindowAttributes(dpy, t->strip, &attr)) {
+    if (!XGetWindowAttributes(dpy, win, &attr)) {
         return 0;
     }
     if (!attr.override_redirect || attr.map_state != IsViewable) {
         return 0;
     }
-    if (!win_is_wecom(t->strip)) {
+    if (attr.depth != 32 || win == t->main || win == t->ring) {
         return 0;
     }
-    if (t->pid != 0 && win_pid(t->strip) != t->pid) {
+    if (!win_is_wecom(win)) {
         return 0;
     }
-    if (!win_rect(t->strip, &r)) {
+    if (t->pid != 0 && win_pid(win) != t->pid) {
         return 0;
     }
-    if (r.h > STRIP_MAX_HEIGHT) {
+    if (r->w * r->h < OVERLAY_MIN_AREA || r->h > OVERLAY_MAX_HEIGHT) {
         return 0;
     }
-    if (abs(r.x - m->x) > 200 || abs(r.y - m->y) > 200) {
+    if (r->x < m->x - OVERLAY_SLACK || r->y < m->y - OVERLAY_SLACK) {
         return 0;
     }
-    if (abs(r.w - m->w) > 64) {
+    if (r->x + r->w > m->x + m->w + OVERLAY_SLACK ||
+        r->y + r->h > m->y + m->h + OVERLAY_SLACK) {
+        return 0;
+    }
+    if (overlay_is_popup(win)) {
         return 0;
     }
     return 1;
 }
 
-static void find_strip(Target *t, const Rect *m)
+static int overlay_capture_base(Overlay *o)
 {
-    Window root_ret, parent_ret, *top = NULL;
-    unsigned int ntop = 0;
+    int count = 0;
+    int ordering = 0;
+    XRectangle *rects;
+    Rect s;
 
-    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &top, &ntop)) {
-        return;
+    o->base = NULL;
+    o->base_count = 0;
+    if (!win_rect(o->win, &s)) {
+        return 0;
     }
-    for (unsigned int i = 0; i < ntop; i++) {
-        Window win = top[i];
-        XWindowAttributes attr;
-        Rect r;
+    rects = XShapeGetRectangles(dpy, o->win, ShapeBounding, &count, &ordering);
+    if (rects == NULL || count <= 0) {
+        if (rects != NULL) {
+            XFree(rects);
+        }
+        return 1;
+    }
+    if (count == 1 && rects[0].x == 0 && rects[0].y == 0 &&
+        rects[0].width == (unsigned short)s.w &&
+        rects[0].height == (unsigned short)s.h) {
+        /* Unshaped window: an implicit full rectangle is enough. */
+        XFree(rects);
+        return 1;
+    }
+    o->base = rects;
+    o->base_count = count;
+    return 1;
+}
 
-        if (!XGetWindowAttributes(dpy, win, &attr)) {
-            continue;
-        }
-        if (!attr.override_redirect || attr.map_state != IsViewable) {
-            continue;
-        }
-        if (!win_is_wecom(win)) {
-            continue;
-        }
-        if (t->pid != 0 && win_pid(win) != t->pid) {
-            continue;
-        }
-        if (!win_rect(win, &r)) {
-            continue;
-        }
-        if (r.h > STRIP_MAX_HEIGHT) {
-            continue;
-        }
-        if (abs(r.x - m->x) > 200 || abs(r.y - m->y) > 200) {
-            continue;
-        }
-        if (abs(r.w - m->w) > 64) {
-            continue;
-        }
-        t->strip = win;
-        if (top != NULL) {
-            XFree(top);
-        }
-        return;
+static void overlay_free(Overlay *o)
+{
+    if (o->base != NULL) {
+        XFree(o->base);
     }
-    if (top != NULL) {
-        XFree(top);
-    }
+    memset(o, 0, sizeof(*o));
 }
 
 static void classify(Target *t)
@@ -665,9 +735,127 @@ static void classify(Target *t)
     if (!ring_still_valid(t, &m)) {
         find_ring(t, &m);
     }
-    if (!strip_still_valid(t, &m)) {
-        t->strip = None;
-        find_strip(t, &m);
+}
+
+/*
+ * Attach every chrome overlay window to the target it belongs to.  Called on
+ * each scan; overlays that disappeared are dropped and the ones that are still
+ * there keep their captured base shape.
+ */
+static void assign_overlays(void)
+{
+    Window root_ret, parent_ret, *top = NULL;
+    unsigned int ntop = 0;
+    Rect mains[MAX_TARGETS];
+    int frames[MAX_TARGETS];
+    int changed = 0;
+
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &top, &ntop)) {
+        return;
+    }
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+
+        frames[i] = -1;
+        for (int j = 0; j < t->overlay_count; j++) {
+            t->overlays[j].seen = 0;
+        }
+        if (!t->valid || !win_rect(t->main, &mains[i])) {
+            continue;
+        }
+        for (unsigned int k = 0; k < ntop; k++) {
+            if (top[k] == t->frame) {
+                frames[i] = (int)k;
+                break;
+            }
+        }
+    }
+
+    for (unsigned int k = 0; k < ntop; k++) {
+        Window win = top[k];
+        Rect r;
+        int best = -1;
+        int best_score = 0;
+
+        if (!win_rect(win, &r)) {
+            continue;
+        }
+        for (int i = 0; i < MAX_TARGETS; i++) {
+            Target *t = &targets[i];
+            int score;
+
+            if (!t->valid || frames[i] < 0 || (int)k < frames[i]) {
+                continue;
+            }
+            if (!overlay_candidate_ok(win, t, &mains[i], &r)) {
+                continue;
+            }
+            score = abs((r.x + r.w) - (mains[i].x + mains[i].w)) +
+                    abs(r.y - mains[i].y);
+            if (best < 0 || score < best_score) {
+                best = i;
+                best_score = score;
+            }
+        }
+        if (best < 0) {
+            continue;
+        }
+
+        Target *t = &targets[best];
+        int slot = -1;
+
+        for (int j = 0; j < t->overlay_count; j++) {
+            if (t->overlays[j].win == win) {
+                t->overlays[j].seen = 1;
+                slot = j;
+                break;
+            }
+        }
+        if (slot < 0 && t->overlay_count < MAX_OVERLAYS) {
+            Overlay *o = &t->overlays[t->overlay_count];
+
+            memset(o, 0, sizeof(*o));
+            o->win = win;
+            if (overlay_capture_base(o)) {
+                o->seen = 1;
+                t->overlay_count++;
+                changed = 1;
+                logmsg("overlay %#lx of main %#lx (base rects=%d)", win,
+                       t->main, o->base_count);
+            } else {
+                memset(o, 0, sizeof(*o));
+            }
+        }
+    }
+
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+        int kept = 0;
+
+        for (int j = 0; j < t->overlay_count; j++) {
+            if (!t->overlays[j].seen) {
+                logmsg("drop overlay %#lx of main %#lx", t->overlays[j].win,
+                       t->main);
+                overlay_restore(t, &t->overlays[j]);
+                overlay_free(&t->overlays[j]);
+                changed = 1;
+                continue;
+            }
+            if (kept != j) {
+                t->overlays[kept] = t->overlays[j];
+            }
+            kept++;
+        }
+        for (int j = kept; j < MAX_OVERLAYS; j++) {
+            memset(&t->overlays[j], 0, sizeof(t->overlays[j]));
+        }
+        t->overlay_count = kept;
+    }
+    if (changed) {
+        shape_dirty = 1;
+    }
+    if (top != NULL) {
+        XFree(top);
     }
 }
 
@@ -757,6 +945,10 @@ static void forget_target(Target *t)
     if (t->valid) {
         logmsg("forget main %#lx", t->main);
     }
+    for (int i = 0; i < t->overlay_count; i++) {
+        overlay_restore(t, &t->overlays[i]);
+        overlay_free(&t->overlays[i]);
+    }
     memset(t, 0, sizeof(*t));
 }
 
@@ -780,7 +972,6 @@ static void scan(void)
             }
         }
         if (!seen) {
-            strip_restore_full(&targets[i]);
             forget_target(&targets[i]);
         }
     }
@@ -817,10 +1008,11 @@ static void scan(void)
         XSelectInput(dpy, slot->frame,
                      StructureNotifyMask | SubstructureNotifyMask);
         XSelectInput(dpy, slot->main, StructureNotifyMask);
-        logmsg("target main=%#lx frame=%#lx ring=%#lx pad=%d strip=%#lx",
+        logmsg("target main=%#lx frame=%#lx ring=%#lx pad=%d overlays=%d",
                slot->main, slot->frame, slot->ring, slot->ring_pad,
-               slot->strip);
+               slot->overlay_count);
     }
+    assign_overlays();
 }
 
 static void reconcile_geometry(Target *t)
@@ -829,7 +1021,7 @@ static void reconcile_geometry(Target *t)
         return;
     }
     glue_ring(t);
-    glue_strip(t);
+    glue_overlays(t);
 }
 
 static void reconcile_shape(Target *t)
@@ -837,7 +1029,9 @@ static void reconcile_shape(Target *t)
     if (!t->valid) {
         return;
     }
-    strip_apply_shape(t);
+    for (int i = 0; i < t->overlay_count; i++) {
+        overlay_apply_shape(t, &t->overlays[i]);
+    }
 }
 
 static void on_signal(int sig)
@@ -873,7 +1067,7 @@ static void print_scan_result(void)
 {
     for (int i = 0; i < MAX_TARGETS; i++) {
         Target *t = &targets[i];
-        Rect m = {0}, r = {0}, s = {0};
+        Rect m = {0}, r = {0};
 
         if (!t->valid) {
             continue;
@@ -887,10 +1081,15 @@ static void print_scan_result(void)
         } else {
             printf("  ring=none\n");
         }
-        if (win_rect(t->strip, &s)) {
-            printf("  strip=%#lx %dx%d+%d+%d\n", t->strip, s.w, s.h, s.x, s.y);
-        } else {
-            printf("  strip=none\n");
+        printf("  overlays=%d\n", t->overlay_count);
+        for (int j = 0; j < t->overlay_count; j++) {
+            Rect s = {0};
+
+            if (win_rect(t->overlays[j].win, &s)) {
+                printf("    overlay=%#lx %dx%d+%d+%d base=%d\n",
+                       t->overlays[j].win, s.w, s.h, s.x, s.y,
+                       t->overlays[j].base_count);
+            }
         }
     }
 }
@@ -899,19 +1098,25 @@ static void print_holes(void)
 {
     for (int i = 0; i < MAX_TARGETS; i++) {
         Target *t = &targets[i];
-        Rect s;
-        XRectangle holes[MAX_HOLES];
-        int n;
 
-        if (!t->valid || !win_rect(t->strip, &s)) {
+        if (!t->valid) {
             continue;
         }
-        n = collect_occluders(t, &s, holes, MAX_HOLES);
-        printf("strip=%#lx %dx%d+%d+%d holes=%d\n", t->strip, s.w, s.h, s.x,
-               s.y, n);
-        for (int j = 0; j < n; j++) {
-            printf("  hole %d,%d %ux%u\n", holes[j].x, holes[j].y,
-                   holes[j].width, holes[j].height);
+        for (int k = 0; k < t->overlay_count; k++) {
+            Rect s;
+            XRectangle holes[MAX_HOLES];
+            int n;
+
+            if (!win_rect(t->overlays[k].win, &s)) {
+                continue;
+            }
+            n = collect_occluders(t, &s, holes, MAX_HOLES);
+            printf("overlay=%#lx %dx%d+%d+%d holes=%d\n",
+                   t->overlays[k].win, s.w, s.h, s.x, s.y, n);
+            for (int j = 0; j < n; j++) {
+                printf("  hole %d,%d %ux%u\n", holes[j].x, holes[j].y,
+                       holes[j].width, holes[j].height);
+            }
         }
     }
 }
@@ -957,6 +1162,12 @@ int main(int argc, char **argv)
     atom_wm_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
     atom_wm_window_type_normal =
         XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
+    atom_wm_window_type_popup_menu =
+        XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_POPUP_MENU", False);
+    atom_wm_window_type_dropdown_menu =
+        XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU", False);
+    atom_wm_window_type_tooltip =
+        XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
     atom_client_list = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
 
     int shape_event, shape_error;
@@ -1020,7 +1231,7 @@ int main(int argc, char **argv)
                         ev.xconfigure.window == targets[i].main) {
                         if (!dry_run) {
                             glue_ring(&targets[i]);
-                            glue_strip(&targets[i]);
+                            glue_overlays(&targets[i]);
                             hot_until = now_ms() + HOT_WINDOW_MS;
                         }
                     }
@@ -1085,7 +1296,9 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < MAX_TARGETS; i++) {
         if (targets[i].valid && !dry_run) {
-            strip_restore_full(&targets[i]);
+            for (int j = 0; j < targets[i].overlay_count; j++) {
+                overlay_restore(&targets[i], &targets[i].overlays[j]);
+            }
         }
     }
     XSync(dpy, False);
