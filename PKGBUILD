@@ -1,8 +1,8 @@
 # Maintainer: Peknight <JKpeknight@gmail.com>
 
 pkgname=wecom-x11-fix
-pkgver=1.1.0
-pkgrel=1
+pkgver=1.0.0
+pkgrel=2
 pkgdesc='X11 workarounds for Deepin-Wine WeCom: click-through title bar and lagging shadow border'
 arch=('x86_64')
 url='https://aur.archlinux.org/packages/wecom-x11-fix'
