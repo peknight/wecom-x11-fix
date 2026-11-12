@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=WeCom X11 Fix
+Comment=Work around Deepin-Wine WeCom window bugs on X11
+Exec=/usr/bin/wecom-x11-fix
+Terminal=false
+NoDisplay=true
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
