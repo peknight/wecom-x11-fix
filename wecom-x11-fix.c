@@ -7,10 +7,11 @@
  *    edge of its main window (a client-side title bar strip) and raises it
  *    above every other window on the screen.  Because the strip has a full
  *    input shape, clicks aimed at whatever is really on top at that place are
- *    swallowed by WeCom.  The strip's input region is trimmed by the areas
- *    that are covered by windows stacked above WeCom, so those clicks reach
- *    the window the user actually sees, while the uncovered part of the
- *    strip keeps working as WeCom's title bar.
+ *    swallowed by WeCom.  The strip's input and bounding regions are trimmed
+ *    by the areas that are covered by windows stacked above WeCom, so those
+ *    clicks reach the window the user actually sees and the caption buttons
+ *    the strip draws there stop bleeding through it, while the uncovered part
+ *    of the strip keeps working as WeCom's title bar.
  *
  * 2. WeCom draws its drop shadow into a separate 32 bit window that is larger
  *    than the main window on every side.  During an interactive move or
@@ -295,7 +296,7 @@ static int collect_occluders(Target *t, const Rect *strip, XRectangle *holes,
     return n;
 }
 
-static void strip_apply_input(Target *t)
+static void strip_apply_shape(Target *t)
 {
     Rect s;
     XRectangle full;
@@ -318,6 +319,7 @@ static void strip_apply_input(Target *t)
         XFixesSubtractRegion(dpy, region, region, covered);
         XFixesDestroyRegion(dpy, covered);
     }
+    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeBounding, 0, 0, region);
     XFixesSetWindowShapeRegion(dpy, t->strip, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
@@ -337,6 +339,7 @@ static void strip_restore_full(Target *t)
     full.width = (unsigned short)s.w;
     full.height = (unsigned short)s.h;
     region = XFixesCreateRegion(dpy, &full, 1);
+    XFixesSetWindowShapeRegion(dpy, t->strip, ShapeBounding, 0, 0, region);
     XFixesSetWindowShapeRegion(dpy, t->strip, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
@@ -813,12 +816,12 @@ static void reconcile_geometry(Target *t)
     glue_strip(t);
 }
 
-static void reconcile_input(Target *t)
+static void reconcile_shape(Target *t)
 {
     if (!t->valid) {
         return;
     }
-    strip_apply_input(t);
+    strip_apply_shape(t);
 }
 
 static void on_signal(int sig)
@@ -1031,7 +1034,7 @@ int main(int argc, char **argv)
             if (shape_dirty) {
                 for (int i = 0; i < MAX_TARGETS; i++) {
                     if (!dry_run) {
-                        reconcile_input(&targets[i]);
+                        reconcile_shape(&targets[i]);
                     }
                 }
                 shape_dirty = 0;
