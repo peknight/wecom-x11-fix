@@ -1,7 +1,7 @@
 # Maintainer: Peknight <JKpeknight@gmail.com>
 
 pkgname=wecom-x11-fix
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='X11 workarounds for Deepin-Wine WeCom: click-through title bar and lagging shadow border'
 arch=('x86_64')
@@ -15,7 +15,7 @@ source=(
     "$pkgname.desktop"
     'LICENSE'
 )
-sha256sums=('fa305282a0973c75bfb7e6cd81ebd9530a9560aa8ac9d29bd559bc9b486489cc'
+sha256sums=('09595296e2f4d74109e5b15f2cfac8963b9c9a0885faba58ea0e62cabd0312c6'
             '2d6a9156999e1dc9b03e73be5316251cd37b825febb74730c1e2ceae28741861'
             'cbb1198d2e81e77fee29db96bc1144d9e13912f15988469091f460832441cddd'
             'af1cf152f25f065779033a30ee9d087a65fc10bb0e037ba6b51132084a68622d')

@@ -43,7 +43,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define WECOM_CLASS "com.qq.weixin.work.deepin"
+/*
+ * 两个发行线路跑的是同一个程序、带同一套 bug，但窗口的 WM_CLASS 不同：
+ * deepin 的 deb 包由它自己的 run.sh 导出 com.qq.weixin.work.deepin，Windows exe
+ * 那条线路用 wecom-win（见 wecom-win-bin 的启动器）。两条线路都会被修复，所以
+ * 这里认一个集合而不是单值。
+ */
+static const char *const wecom_classes[] = {
+    "com.qq.weixin.work.deepin",
+    "wecom-win",
+};
 #define MAX_TARGETS 8
 #define RING_PAD_MIN 2
 #define RING_PAD_MAX 40
@@ -169,7 +178,14 @@ static int win_is_wecom(Window win)
         return 0;
     }
     if (hint.res_class != NULL) {
-        match = strcmp(hint.res_class, WECOM_CLASS) == 0;
+        size_t i;
+
+        for (i = 0; i < sizeof(wecom_classes) / sizeof(wecom_classes[0]); i++) {
+            if (strcmp(hint.res_class, wecom_classes[i]) == 0) {
+                match = 1;
+                break;
+            }
+        }
     }
     if (hint.res_name != NULL) {
         XFree(hint.res_name);
