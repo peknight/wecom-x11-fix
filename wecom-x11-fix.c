@@ -54,7 +54,7 @@
 #define GLUE_INTERVAL_MS 50.0
 #define IDLE_GLUE_INTERVAL_MS 250.0
 #define HOT_WINDOW_MS 600.0
-#define SHAPE_INTERVAL_MS 250.0
+#define SHAPE_INTERVAL_MS 30.0
 
 typedef struct {
     int x, y, w, h;
