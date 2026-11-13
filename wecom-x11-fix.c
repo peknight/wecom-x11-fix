@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/file.h>
 #include <sys/select.h>
 #include <time.h>
@@ -50,10 +51,17 @@
  * deepin 的 deb 包由它自己的 run.sh 导出 com.qq.weixin.work.deepin，Windows exe
  * 那条线路用 wecom-win（见 wecom-win-bin 的启动器）。两条线路都会被修复，所以
  * 这里认一个集合而不是单值。
+ *
+ * 不经过启动器、手工 wine 起来的实例没有 WINE_WMCLASS，WM_CLASS 会退回
+ * ("wxwork.exe", "Wine")，按类名就漏掉了；这种实例同样有那两套 bug，所以再按
+ * 可执行文件名认一次。只认 wxwork.exe，不会波及其它 Wine 程序。
  */
 static const char *const wecom_classes[] = {
     "com.qq.weixin.work.deepin",
     "wecom-win",
+};
+static const char *const wecom_names[] = {
+    "wxwork.exe",
 };
 #define MAX_TARGETS 8
 #define RING_PAD_MIN 2
@@ -205,6 +213,16 @@ static int win_is_wecom(Window win)
 
         for (i = 0; i < sizeof(wecom_classes) / sizeof(wecom_classes[0]); i++) {
             if (strcmp(hint.res_class, wecom_classes[i]) == 0) {
+                match = 1;
+                break;
+            }
+        }
+    }
+    if (!match && hint.res_name != NULL) {
+        size_t i;
+
+        for (i = 0; i < sizeof(wecom_names) / sizeof(wecom_names[0]); i++) {
+            if (strcasecmp(hint.res_name, wecom_names[i]) == 0) {
                 match = 1;
                 break;
             }
