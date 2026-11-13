@@ -78,6 +78,8 @@ static const char *const wecom_names[] = {
 #define IDLE_GLUE_INTERVAL_MS 250.0
 #define HOT_WINDOW_MS 600.0
 #define SHAPE_INTERVAL_MS 30.0
+#define SHAPE_WATCHDOG_MS 250.0
+#define SHAPE_ECHO_MS 150.0
 
 typedef struct {
     int x, y, w, h;
@@ -93,7 +95,10 @@ typedef struct {
     Window win;
     XRectangle *base;
     int base_count;
+    XRectangle *applied;
+    int applied_count;
     int seen;
+    double applied_ms;
 } Overlay;
 
 typedef struct {
@@ -104,6 +109,8 @@ typedef struct {
     Overlay overlays[MAX_OVERLAYS];
     int overlay_count;
     int ring_pad;
+    int glue_dx, glue_dy, glue_dw, glue_dh;
+    int glue_stuck;
     unsigned long pid;
     int valid;
 } Target;
@@ -124,6 +131,8 @@ static Atom atom_wm_window_type_tooltip;
 static Atom atom_client_list;
 
 static Target targets[MAX_TARGETS];
+
+static int shape_event_base;
 
 static double now_ms(void)
 {
@@ -300,6 +309,23 @@ static int win_is_known_overlay(Window win)
     return 0;
 }
 
+static Overlay *find_overlay(Window win)
+{
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+
+        if (!t->valid) {
+            continue;
+        }
+        for (int j = 0; j < t->overlay_count; j++) {
+            if (t->overlays[j].win == win) {
+                return &t->overlays[j];
+            }
+        }
+    }
+    return NULL;
+}
+
 /*
  * Fill a hole list with the parts of an overlay rectangle that are covered by
  * windows stacked above the WeCom frame it belongs to.  Coordinates are
@@ -390,6 +416,62 @@ static XserverRegion overlay_base_region(const Overlay *o, const Rect *s)
     return overlay_full_region(s);
 }
 
+static int rect_lists_equal(const XRectangle *a, int na, const XRectangle *b,
+                            int nb)
+{
+    if (na != nb) {
+        return 0;
+    }
+    for (int i = 0; i < na; i++) {
+        if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].width != b[i].width ||
+            a[i].height != b[i].height) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/*
+ * Wine rewrites the shape of its layered windows (the title bar strip
+ * included) on repaint and focus changes, and that rewrite restores the full
+ * input shape: the buttons stop being drawn but start swallowing clicks again.
+ * Compare what the server currently has with the region we want so that the
+ * fix can be re-asserted whenever someone else has overwritten it.
+ */
+static int window_shape_is(Window win, const XRectangle *want, int nwant)
+{
+    int nbound = 0, ninput = 0, ordering = 0;
+    XRectangle *bound = XShapeGetRectangles(dpy, win, ShapeBounding, &nbound,
+                                            &ordering);
+    XRectangle *input = XShapeGetRectangles(dpy, win, ShapeInput, &ninput,
+                                            &ordering);
+    int match = bound != NULL && input != NULL &&
+                rect_lists_equal(want, nwant, bound, nbound) &&
+                rect_lists_equal(want, nwant, input, ninput);
+
+    if (bound != NULL) {
+        XFree(bound);
+    }
+    if (input != NULL) {
+        XFree(input);
+    }
+    return match;
+}
+
+/*
+ * Cheap check used by the watchdog: only asks the server what the window's
+ * shape is now and compares it with the list we last applied.  Recomputing
+ * the occluders here would walk every top-level window three round trips at a
+ * time, which is far too much work to do on a timer.
+ */
+static int overlay_shape_intact(const Overlay *o)
+{
+    if (o->applied == NULL) {
+        return 0;
+    }
+    return window_shape_is(o->win, o->applied, o->applied_count);
+}
+
 static void overlay_apply_shape(Target *t, Overlay *o)
 {
     Rect s;
@@ -407,10 +489,23 @@ static void overlay_apply_shape(Target *t, Overlay *o)
         XFixesSubtractRegion(dpy, region, region, covered);
         XFixesDestroyRegion(dpy, covered);
     }
-    XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
-    XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
+    int nwant = 0;
+    XRectangle *want = XFixesFetchRegion(dpy, region, &nwant);
+
+    if (want != NULL && !window_shape_is(o->win, want, nwant)) {
+        XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
+        XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
+        XFlush(dpy);
+        o->applied_ms = now_ms();
+    }
+    if (want != NULL) {
+        if (o->applied != NULL) {
+            XFree(o->applied);
+        }
+        o->applied = want;
+        o->applied_count = nwant;
+    }
     XFixesDestroyRegion(dpy, region);
-    XFlush(dpy);
 }
 
 static void overlay_restore(Target *t, Overlay *o)
@@ -452,7 +547,28 @@ static void glue_ring(Target *t)
     dw = (m.w + 2 * t->ring_pad) - client.w;
     dh = (m.h + 2 * t->ring_pad) - client.h;
     if (dx == 0 && dy == 0 && dw == 0 && dh == 0) {
+        t->glue_stuck = 0;
         return;
+    }
+    /*
+     * When the shadow shares its frame with the main window, moving that frame
+     * shifts both, so the delta never changes.  A window manager that clamps
+     * the frame (against a panel, say) then turns this into an endless move
+     * loop at the glue interval.  Give up while the numbers stay the same; a
+     * real move of the window changes them and the glue resumes by itself.
+     */
+    if (dx == t->glue_dx && dy == t->glue_dy && dw == t->glue_dw &&
+        dh == t->glue_dh) {
+        if (t->glue_stuck >= 3) {
+            return;
+        }
+        t->glue_stuck++;
+    } else {
+        t->glue_stuck = 0;
+        t->glue_dx = dx;
+        t->glue_dy = dy;
+        t->glue_dw = dw;
+        t->glue_dh = dh;
     }
     XMoveResizeWindow(dpy, t->ring_frame, frame.x + dx, frame.y + dy,
                       (unsigned)(frame.w + dw), (unsigned)(frame.h + dh));
@@ -737,6 +853,9 @@ static void overlay_free(Overlay *o)
     if (o->base != NULL) {
         XFree(o->base);
     }
+    if (o->applied != NULL) {
+        XFree(o->applied);
+    }
     memset(o, 0, sizeof(*o));
 }
 
@@ -838,6 +957,7 @@ static void assign_overlays(void)
                 o->seen = 1;
                 t->overlay_count++;
                 changed = 1;
+                XShapeSelectInput(dpy, win, ShapeNotifyMask);
                 logmsg("overlay %#lx of main %#lx (base rects=%d)", win,
                        t->main, o->base_count);
             } else {
@@ -1193,6 +1313,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "wecom-x11-fix: XShape extension missing\n");
         return 1;
     }
+    shape_event_base = shape_event;
     int fixes_event, fixes_error;
     if (!XFixesQueryExtension(dpy, &fixes_event, &fixes_error)) {
         fprintf(stderr, "wecom-x11-fix: XFixes extension missing\n");
@@ -1224,6 +1345,7 @@ int main(int argc, char **argv)
     double next_scan = now_ms();
     double next_glue = now_ms();
     double next_shape = now_ms();
+    double next_shape_watch = now_ms();
 
     while (running) {
         while (XPending(dpy)) {
@@ -1239,6 +1361,16 @@ int main(int argc, char **argv)
             } else if (ev.type == ConfigureNotify ||
                        ev.type == CirculateNotify) {
                 shape_dirty = 1;
+            } else if (ev.type == shape_event_base + ShapeNotify) {
+                XShapeEvent *se = (XShapeEvent *)&ev;
+                Overlay *o = find_overlay(se->window);
+
+                /* Our own re-shape echoes back; only react to other writers. */
+                if (o != NULL && now_ms() - o->applied_ms > SHAPE_ECHO_MS) {
+                    logmsg("shape of overlay %#lx overwritten externally",
+                           o->win);
+                    shape_dirty = 1;
+                }
             }
             if (ev.type == ConfigureNotify) {
                 for (int i = 0; i < MAX_TARGETS; i++) {
@@ -1285,6 +1417,22 @@ int main(int argc, char **argv)
                 shape_dirty = 0;
             }
             next_shape = now + SHAPE_INTERVAL_MS;
+        }
+        if (now >= next_shape_watch) {
+            for (int i = 0; i < MAX_TARGETS; i++) {
+                Target *t = &targets[i];
+
+                if (!t->valid) {
+                    continue;
+                }
+                for (int j = 0; j < t->overlay_count; j++) {
+                    if (!overlay_shape_intact(&t->overlays[j])) {
+                        shape_dirty = 1;
+                        break;
+                    }
+                }
+            }
+            next_shape_watch = now + SHAPE_WATCHDOG_MS;
         }
 
         double wake = next_scan < next_glue ? next_scan : next_glue;
