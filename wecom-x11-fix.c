@@ -59,6 +59,7 @@
 static const char *const wecom_classes[] = {
     "com.qq.weixin.work.deepin",
     "wecom-win",
+    "wecom-win11",
 };
 static const char *const wecom_names[] = {
     "wxwork.exe",
