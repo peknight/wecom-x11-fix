@@ -2,7 +2,7 @@
 
 pkgname=wecom-x11-fix
 pkgver=1.0.0
-pkgrel=9
+pkgrel=10
 pkgdesc='X11 workarounds for Wine WeCom: chrome windows that bleed through dialogs and swallow clicks, the lagging shadow border, and the opaque inner shadow band'
 arch=('x86_64')
 url='https://aur.archlinux.org/packages/wecom-x11-fix'
@@ -15,7 +15,7 @@ source=(
     "$pkgname.desktop"
     'LICENSE'
 )
-sha256sums=('3fa07b8234ac57e1c0330c4eaa1f68e03d22f83aebaa49667f16271970c4d2e0'
+sha256sums=('b4933a5dc3dfc18c2c7daaba4d04c541b9b92df0283bb1c149d0f046d79a782c'
             '2d6a9156999e1dc9b03e73be5316251cd37b825febb74730c1e2ceae28741861'
             'cbb1198d2e81e77fee29db96bc1144d9e13912f15988469091f460832441cddd'
             'af1cf152f25f065779033a30ee9d087a65fc10bb0e037ba6b51132084a68622d')

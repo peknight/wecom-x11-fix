@@ -28,6 +28,13 @@
  *    window.  The shadow's bounding shape is intersected with the area outside
  *    its owner window, so only the soft outer shadow is kept.
  *
+ *    Mail windows live in a separate WeMail.exe process.  Its shadow is an
+ *    override-redirect ARGB window without WM_TRANSIENT_FOR, and Wine keeps it
+ *    above every other top-level, so the same inner band also floats above
+ *    windows that cover the mail window.  Shadow candidates therefore include
+ *    override-redirect windows, and the shadow shape is clipped by the windows
+ *    stacked above its owner as well as by the owner itself.
+ *
  * Nothing is written to the Wine prefix, the application data or any
  * configuration file.  The program only adjusts X11 window geometry and
  * input shapes; it restores the original shapes when it exits.
@@ -61,7 +68,8 @@
  *
  * 不经过启动器、手工 wine 起来的实例没有 WINE_WMCLASS，WM_CLASS 会退回
  * ("wxwork.exe", "Wine")，按类名就漏掉了；这种实例同样有那两套 bug，所以再按
- * 可执行文件名认一次。只认 wxwork.exe，不会波及其它 Wine 程序。
+ * 可执行文件名认一次。wxwork.exe 是主程序，wemail.exe 是邮件窗口所在的
+ * 独立进程；只认这两个名字，不会波及其它 Wine 程序。
  */
 static const char *const wecom_classes[] = {
     "com.qq.weixin.work.deepin",
@@ -70,6 +78,7 @@ static const char *const wecom_classes[] = {
 };
 static const char *const wecom_names[] = {
     "wxwork.exe",
+    "wemail.exe",
 };
 #define MAX_TARGETS 8
 #define RING_PAD_MIN 2
@@ -717,6 +726,20 @@ static void ring_apply_shape(Target *t)
     XFixesSubtractRegion(dpy, region, region, cut);
     XFixesDestroyRegion(dpy, cut);
 
+    /*
+     * The mail window's shadow is override-redirect and sits above ordinary
+     * windows, so its opaque band still shows through whatever covers the
+     * window.  Drop the parts of the shadow that are hidden behind windows
+     * stacked above the owner as well.
+     */
+    XRectangle holes[MAX_HOLES];
+    int nholes = collect_occluders(t, &r, holes, MAX_HOLES);
+    if (nholes > 0) {
+        cut = XFixesCreateRegion(dpy, holes, nholes);
+        XFixesSubtractRegion(dpy, region, region, cut);
+        XFixesDestroyRegion(dpy, cut);
+    }
+
     want = XFixesFetchRegion(dpy, region, &nwant);
     if (want != NULL && !bounding_shape_is(rs->win, want, nwant)) {
         XFixesSetWindowShapeRegion(dpy, rs->win, ShapeBounding, 0, 0, region);
@@ -855,8 +878,7 @@ static int ring_still_valid(Target *t, const Rect *m)
     if (t->ring == None || !XGetWindowAttributes(dpy, t->ring, &attr)) {
         return 0;
     }
-    if (attr.map_state != IsViewable || attr.depth != 32 ||
-        attr.override_redirect) {
+    if (attr.map_state != IsViewable || attr.depth != 32) {
         return 0;
     }
     if (!win_is_wecom(t->ring)) {
@@ -886,8 +908,7 @@ static int ring_candidate_ok(Window cand, Target *t, const Rect *m, int *pad_out
     if (cand == None || cand == t->main || !XGetWindowAttributes(dpy, cand, &attr)) {
         return 0;
     }
-    if (attr.map_state != IsViewable || attr.depth != 32 ||
-        attr.override_redirect) {
+    if (attr.map_state != IsViewable || attr.depth != 32) {
         return 0;
     }
     if (!win_is_wecom(cand)) {
@@ -896,10 +917,16 @@ static int ring_candidate_ok(Window cand, Target *t, const Rect *m, int *pad_out
     if (t->pid != 0 && win_pid(cand) != t->pid) {
         return 0;
     }
-    if (!XGetTransientForHint(dpy, cand, &trans)) {
-        return 0;
-    }
-    if (trans != t->main && trans != t->frame) {
+    /*
+     * wxwork's shadow is a managed window with WM_TRANSIENT_FOR pointing at
+     * its owner.  WeMail's shadow is override-redirect and has no transient
+     * hint, so only require the hint when the candidate is managed.
+     */
+    if (XGetTransientForHint(dpy, cand, &trans)) {
+        if (trans != t->main && trans != t->frame) {
+            return 0;
+        }
+    } else if (!attr.override_redirect) {
         return 0;
     }
     if (!win_rect(cand, &r)) {
@@ -941,6 +968,43 @@ static void consider_ring_candidate(Target *t, Window cand, const Rect *m,
     }
 }
 
+/*
+ * Managed clients are covered by _NET_CLIENT_LIST, but WeMail's shadow is
+ * override-redirect and therefore never appears there.  Walk the root tree as
+ * well so that both kinds of shadow can be found.
+ */
+static void consider_ring_candidates_in_tree(Target *t, const Rect *m,
+                                             Window *best, int *best_pad,
+                                             int *best_dist)
+{
+    Window root_ret, parent_ret, *top = NULL;
+    unsigned int ntop = 0;
+
+    if (!XQueryTree(dpy, root, &root_ret, &parent_ret, &top, &ntop)) {
+        return;
+    }
+    for (unsigned int i = 0; i < ntop; i++) {
+        Window root_ret2, parent_ret2, *children = NULL;
+        unsigned int nchildren = 0;
+
+        consider_ring_candidate(t, top[i], m, best, best_pad, best_dist);
+        if (!XQueryTree(dpy, top[i], &root_ret2, &parent_ret2, &children,
+                        &nchildren)) {
+            continue;
+        }
+        for (unsigned int c = 0; c < nchildren; c++) {
+            consider_ring_candidate(t, children[c], m, best, best_pad,
+                                    best_dist);
+        }
+        if (children != NULL) {
+            XFree(children);
+        }
+    }
+    if (top != NULL) {
+        XFree(top);
+    }
+}
+
 static void find_ring(Target *t, const Rect *m)
 {
     Atom type;
@@ -964,32 +1028,8 @@ static void find_ring(Target *t, const Rect *m)
                                     &best_dist);
         }
         XFree(data);
-    } else {
-        Window root_ret, parent_ret, *top = NULL;
-        unsigned int ntop = 0;
-        if (XQueryTree(dpy, root, &root_ret, &parent_ret, &top, &ntop)) {
-            for (unsigned int i = 0; i < ntop; i++) {
-                Window root_ret2, parent_ret2, *children = NULL;
-                unsigned int nchildren = 0;
-                consider_ring_candidate(t, top[i], m, &best, &best_pad,
-                                        &best_dist);
-                if (!XQueryTree(dpy, top[i], &root_ret2, &parent_ret2,
-                                &children, &nchildren)) {
-                    continue;
-                }
-                for (unsigned int c = 0; c < nchildren; c++) {
-                    consider_ring_candidate(t, children[c], m, &best,
-                                            &best_pad, &best_dist);
-                }
-                if (children != NULL) {
-                    XFree(children);
-                }
-            }
-            if (top != NULL) {
-                XFree(top);
-            }
-        }
     }
+    consider_ring_candidates_in_tree(t, m, &best, &best_pad, &best_dist);
     t->ring = best;
     if (best != None) {
         t->ring_frame = win_top_level(best);
