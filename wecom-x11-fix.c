@@ -21,6 +21,13 @@
  *    as a white border trailing the window.  The shadow is glued to the main
  *    window as soon as the window manager reports a new geometry.
  *
+ * 3. That shadow window paints the inner 8 pixels of its hole - the band that
+ *    sits on top of the window's own edge - as fully opaque white (dialogs)
+ *    or as an opaque copy of the window background (main window).  On dialogs
+ *    such as the assistant panel this reads as a white frame around the
+ *    window.  The shadow's bounding shape is intersected with the area outside
+ *    its owner window, so only the soft outer shadow is kept.
+ *
  * Nothing is written to the Wine prefix, the application data or any
  * configuration file.  The program only adjusts X11 window geometry and
  * input shapes; it restores the original shapes when it exits.
@@ -102,11 +109,27 @@ typedef struct {
     double applied_ms;
 } Overlay;
 
+/*
+ * The shadow window of a target.  base is the shape Wine gave it; the shape we
+ * want is base minus the area covered by the owner window itself, which drops
+ * the opaque inner band while keeping the outer shadow gradient.
+ */
+typedef struct {
+    Window win;
+    XRectangle *base;
+    int base_count;
+    XRectangle *applied;
+    int applied_count;
+    int captured;
+    double applied_ms;
+} RingShape;
+
 typedef struct {
     Window main;
     Window frame;
     Window ring;
     Window ring_frame;
+    RingShape ring_shape;
     Overlay overlays[MAX_OVERLAYS];
     int overlay_count;
     int ring_pad;
@@ -459,6 +482,20 @@ static int window_shape_is(Window win, const XRectangle *want, int nwant)
     return match;
 }
 
+static int bounding_shape_is(Window win, const XRectangle *want, int nwant)
+{
+    int nbound = 0, ordering = 0;
+    XRectangle *bound =
+        XShapeGetRectangles(dpy, win, ShapeBounding, &nbound, &ordering);
+    int match =
+        bound != NULL && rect_lists_equal(want, nwant, bound, nbound);
+
+    if (bound != NULL) {
+        XFree(bound);
+    }
+    return match;
+}
+
 /*
  * Cheap check used by the watchdog: only asks the server what the window's
  * shape is now and compares it with the list we last applied.  Recomputing
@@ -525,6 +562,197 @@ static void overlay_restore(Target *t, Overlay *o)
     XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
+}
+
+static void window_full_rect(Window win, XRectangle *out)
+{
+    Rect r;
+
+    memset(out, 0, sizeof(*out));
+    if (win_rect(win, &r)) {
+        out->width = (unsigned short)r.w;
+        out->height = (unsigned short)r.h;
+    }
+}
+
+/*
+ * Put the shadow window's shape back to what Wine gave it.  Called when the
+ * shadow disappears or is replaced, and on exit.
+ */
+static void ring_shape_restore(Target *t)
+{
+    RingShape *rs = &t->ring_shape;
+    XRectangle full;
+
+    if (!rs->captured || rs->win == None) {
+        return;
+    }
+    if (rs->base_count > 0 && rs->base != NULL) {
+        XShapeCombineRectangles(dpy, rs->win, ShapeBounding, 0, 0, rs->base,
+                                rs->base_count, ShapeSet, Unsorted);
+    } else {
+        window_full_rect(rs->win, &full);
+        XShapeCombineRectangles(dpy, rs->win, ShapeBounding, 0, 0, &full, 1,
+                                ShapeSet, Unsorted);
+    }
+    XFlush(dpy);
+}
+
+static void ring_shape_drop(Target *t, int restore)
+{
+    RingShape *rs = &t->ring_shape;
+
+    if (restore) {
+        ring_shape_restore(t);
+    }
+    if (rs->base != NULL) {
+        XFree(rs->base);
+    }
+    if (rs->applied != NULL) {
+        XFree(rs->applied);
+    }
+    memset(rs, 0, sizeof(*rs));
+}
+
+static void ring_shape_capture(Target *t)
+{
+    RingShape *rs = &t->ring_shape;
+    XRectangle *rects;
+    XRectangle full;
+    int count = 0;
+    int ordering = 0;
+
+    ring_shape_drop(t, 0);
+    if (t->ring == None) {
+        return;
+    }
+    rs->win = t->ring;
+    rects =
+        XShapeGetRectangles(dpy, t->ring, ShapeBounding, &count, &ordering);
+    if (rects == NULL) {
+        return;
+    }
+    window_full_rect(t->ring, &full);
+    if (count <= 0 || (count == 1 && rect_lists_equal(rects, 1, &full, 1))) {
+        /* Unshaped window: an implicit full rectangle is the base. */
+        XFree(rects);
+        rs->captured = 1;
+        return;
+    }
+    rs->base = rects;
+    rs->base_count = count;
+    rs->captured = 1;
+}
+
+/*
+ * Build the owner's own shape in the shadow window's coordinate space.  The
+ * shadow's opaque inner band sits under the owner; subtracting the rounded
+ * shape instead of its bounding rectangle hides that band along the straight
+ * edges while leaving the original soft corner transition intact.
+ */
+static XserverRegion owner_shape_region(Window win, int dx, int dy, int w,
+                                        int h)
+{
+    XRectangle *rects;
+    XRectangle hole;
+    XserverRegion region;
+    int count = 0;
+    int ordering = 0;
+    int i;
+
+    rects = XShapeGetRectangles(dpy, win, ShapeBounding, &count, &ordering);
+    if (rects != NULL && count > 0) {
+        for (i = 0; i < count; i++) {
+            rects[i].x = (short)(rects[i].x + dx);
+            rects[i].y = (short)(rects[i].y + dy);
+        }
+        region = XFixesCreateRegion(dpy, rects, count);
+        XFree(rects);
+        return region;
+    }
+    if (rects != NULL) {
+        XFree(rects);
+    }
+
+    hole.x = (short)dx;
+    hole.y = (short)dy;
+    hole.width = (unsigned short)w;
+    hole.height = (unsigned short)h;
+    return XFixesCreateRegion(dpy, &hole, 1);
+}
+
+/*
+ * Keep only the part of the shadow that lies outside the owner window.  The
+ * inner band of the shadow is painted opaque by Wine, so clipping it away is
+ * what removes the white frame around dialogs.
+ */
+static void ring_apply_shape(Target *t)
+{
+    RingShape *rs = &t->ring_shape;
+    Rect m, r;
+    XRectangle full;
+    XserverRegion region, cut;
+    XRectangle *want;
+    int nwant = 0;
+
+    if (!t->valid || !rs->captured || rs->win == None) {
+        return;
+    }
+    if (!win_rect(t->main, &m) || !win_rect(rs->win, &r)) {
+        return;
+    }
+    if (rs->base_count > 0 && rs->base != NULL) {
+        region = XFixesCreateRegion(dpy, rs->base, rs->base_count);
+    } else {
+        window_full_rect(rs->win, &full);
+        region = XFixesCreateRegion(dpy, &full, 1);
+    }
+
+    if (m.x + m.w <= r.x || m.y + m.h <= r.y || m.x >= r.x + r.w ||
+        m.y >= r.y + r.h) {
+        XFixesDestroyRegion(dpy, region);
+        return;
+    }
+    cut = owner_shape_region(t->main, m.x - r.x, m.y - r.y, m.w, m.h);
+    XFixesSubtractRegion(dpy, region, region, cut);
+    XFixesDestroyRegion(dpy, cut);
+
+    want = XFixesFetchRegion(dpy, region, &nwant);
+    if (want != NULL && !bounding_shape_is(rs->win, want, nwant)) {
+        XFixesSetWindowShapeRegion(dpy, rs->win, ShapeBounding, 0, 0, region);
+        XFlush(dpy);
+        rs->applied_ms = now_ms();
+    }
+    if (want != NULL) {
+        if (rs->applied != NULL) {
+            XFree(rs->applied);
+        }
+        rs->applied = want;
+        rs->applied_count = nwant;
+    }
+    XFixesDestroyRegion(dpy, region);
+}
+
+static int ring_shape_intact(Target *t)
+{
+    RingShape *rs = &t->ring_shape;
+
+    if (!rs->captured || rs->applied == NULL) {
+        return 0;
+    }
+    return bounding_shape_is(rs->win, rs->applied, rs->applied_count);
+}
+
+static RingShape *find_ring_shape(Window win)
+{
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        RingShape *rs = &targets[i].ring_shape;
+
+        if (targets[i].valid && rs->captured && rs->win == win) {
+            return rs;
+        }
+    }
+    return NULL;
 }
 
 /*
@@ -871,7 +1099,15 @@ static void classify(Target *t)
         t->ring_pad = 18;
     }
     if (!ring_still_valid(t, &m)) {
+        /* The old shadow is gone or no longer matches; undo its shape first. */
+        ring_shape_drop(t, 1);
         find_ring(t, &m);
+        if (t->ring != None) {
+            ring_shape_capture(t);
+        }
+    } else if (t->ring_shape.win != t->ring || !t->ring_shape.captured) {
+        ring_shape_drop(t, 0);
+        ring_shape_capture(t);
     }
 }
 
@@ -1084,6 +1320,7 @@ static void forget_target(Target *t)
     if (t->valid) {
         logmsg("forget main %#lx", t->main);
     }
+    ring_shape_drop(t, 1);
     for (int i = 0; i < t->overlay_count; i++) {
         overlay_restore(t, &t->overlays[i]);
         overlay_free(&t->overlays[i]);
@@ -1168,6 +1405,7 @@ static void reconcile_shape(Target *t)
     if (!t->valid) {
         return;
     }
+    ring_apply_shape(t);
     for (int i = 0; i < t->overlay_count; i++) {
         overlay_apply_shape(t, &t->overlays[i]);
     }
@@ -1365,11 +1603,17 @@ int main(int argc, char **argv)
             } else if (ev.type == shape_event_base + ShapeNotify) {
                 XShapeEvent *se = (XShapeEvent *)&ev;
                 Overlay *o = find_overlay(se->window);
+                RingShape *rs = find_ring_shape(se->window);
 
                 /* Our own re-shape echoes back; only react to other writers. */
                 if (o != NULL && now_ms() - o->applied_ms > SHAPE_ECHO_MS) {
                     logmsg("shape of overlay %#lx overwritten externally",
                            o->win);
+                    shape_dirty = 1;
+                }
+                if (rs != NULL && now_ms() - rs->applied_ms > SHAPE_ECHO_MS) {
+                    logmsg("shape of ring %#lx overwritten externally",
+                           rs->win);
                     shape_dirty = 1;
                 }
             }
@@ -1432,6 +1676,9 @@ int main(int argc, char **argv)
                         break;
                     }
                 }
+                if (!ring_shape_intact(t)) {
+                    shape_dirty = 1;
+                }
             }
             next_shape_watch = now + SHAPE_WATCHDOG_MS;
         }
@@ -1463,6 +1710,7 @@ int main(int argc, char **argv)
 
     for (int i = 0; i < MAX_TARGETS; i++) {
         if (targets[i].valid && !dry_run) {
+            ring_shape_drop(&targets[i], 1);
             for (int j = 0; j < targets[i].overlay_count; j++) {
                 overlay_restore(&targets[i], &targets[i].overlays[j]);
             }
