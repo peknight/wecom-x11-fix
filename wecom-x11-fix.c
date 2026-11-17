@@ -83,6 +83,8 @@ static const char *const wecom_names[] = {
 #define MAX_TARGETS 8
 #define RING_PAD_MIN 2
 #define RING_PAD_MAX 40
+#define MAIN_GROW_MAX 640
+#define GROW_SETTLE_MS 800.0
 #define STRIP_MAX_HEIGHT 64
 #define OVERLAY_MAX_HEIGHT 64
 #define OVERLAY_SLACK 64
@@ -112,6 +114,8 @@ typedef struct {
     Window win;
     XRectangle *base;
     int base_count;
+    int base_w;
+    int base_h;
     XRectangle *applied;
     int applied_count;
     int seen;
@@ -144,6 +148,11 @@ typedef struct {
     int ring_pad;
     int glue_dx, glue_dy, glue_dw, glue_dh;
     int glue_stuck;
+    int min_w, min_h;
+    double last_grow_ms;
+    int stale_bw, stale_bh;
+    double stale_since_ms;
+    double last_config_ms;
     unsigned long pid;
     int valid;
 } Target;
@@ -156,6 +165,9 @@ static double hot_until;
 static int shape_dirty = 1;
 
 static Atom atom_wm_pid;
+static Atom atom_wm_state;
+static Atom atom_wm_state_maximized_vert;
+static Atom atom_wm_state_maximized_horz;
 static Atom atom_wm_window_type;
 static Atom atom_wm_window_type_normal;
 static Atom atom_wm_window_type_popup_menu;
@@ -300,6 +312,31 @@ static int win_has_window_type(Window win, Atom wanted)
         XFree(data);
     }
     return found;
+}
+
+static int win_is_maximized(Window win)
+{
+    Atom type;
+    int format;
+    unsigned long count = 0, after = 0;
+    unsigned char *data = NULL;
+    int maximized = 0;
+
+    if (XGetWindowProperty(dpy, win, atom_wm_state, 0, 8, False, XA_ATOM,
+                           &type, &format, &count, &after, &data) == Success &&
+        data != NULL) {
+        Atom *atoms = (Atom *)data;
+
+        for (unsigned long i = 0; i < count; i++) {
+            if (atoms[i] == atom_wm_state_maximized_vert ||
+                atoms[i] == atom_wm_state_maximized_horz) {
+                maximized = 1;
+                break;
+            }
+        }
+        XFree(data);
+    }
+    return maximized;
 }
 
 static Window win_top_level(Window win)
@@ -505,6 +542,261 @@ static int bounding_shape_is(Window win, const XRectangle *want, int nwant)
     return match;
 }
 
+static void shape_bbox(const XRectangle *rects, int count, int *out_w,
+                       int *out_h)
+{
+    int w = 0, h = 0;
+
+    for (int i = 0; i < count; i++) {
+        int right = (int)rects[i].x + (int)rects[i].width;
+        int bottom = (int)rects[i].y + (int)rects[i].height;
+
+        if (right > w) {
+            w = right;
+        }
+        if (bottom > h) {
+            h = bottom;
+        }
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+static int shape_bounds(Window win, int *out_w, int *out_h)
+{
+    int count = 0, ordering = 0, w = 0, h = 0;
+    XRectangle *rects;
+
+    rects = XShapeGetRectangles(dpy, win, ShapeBounding, &count, &ordering);
+    if (rects == NULL) {
+        return 0;
+    }
+    shape_bbox(rects, count, &w, &h);
+    XFree(rects);
+    if (count <= 0) {
+        return 0;
+    }
+    *out_w = w;
+    *out_h = h;
+    return 1;
+}
+
+static void assign_overlays(void);
+
+/*
+ * The size WeCom refuses to go below.  Wine does not export it as a
+ * WM_NORMAL_HINTS minimum, so xfwm4 happily restores a smaller geometry after
+ * unmaximizing; WeCom then keeps its layered surface - and every pixel of its
+ * layout, including the "-[]X" strip - at the old width while the X window is
+ * narrower.  Once that happens the shape is the only remaining witness of the
+ * real surface size, so mirror it into the hints and the window manager will
+ * stop handing out unusable sizes.
+ */
+static void apply_min_size_hints(Target *t, const Rect *m)
+{
+    XSizeHints hints;
+    long supplied = 0;
+    int changed = 0;
+
+    if (t->min_w <= 0 && t->min_h <= 0) {
+        return;
+    }
+    if (!XGetWMNormalHints(dpy, t->main, &hints, &supplied)) {
+        memset(&hints, 0, sizeof(hints));
+    }
+    if (t->min_w > 0 &&
+        (!(hints.flags & PMinSize) || hints.min_width < t->min_w)) {
+        hints.min_width = t->min_w;
+        changed = 1;
+    }
+    if (t->min_h > 0 &&
+        (!(hints.flags & PMinSize) || hints.min_height < t->min_h)) {
+        hints.min_height = t->min_h;
+        changed = 1;
+    }
+    if (!changed) {
+        return;
+    }
+    if (!(hints.flags & PMinSize)) {
+        hints.flags |= PMinSize;
+        if (hints.min_width <= 0) {
+            hints.min_width = 1;
+        }
+        if (hints.min_height <= 0) {
+            hints.min_height = 1;
+        }
+    }
+    if (!(hints.flags & (USPosition | PPosition))) {
+        hints.flags |= USPosition;
+        hints.x = m->x;
+        hints.y = m->y;
+    }
+    XSetWMNormalHints(dpy, t->main, &hints);
+    XFlush(dpy);
+    logmsg("main %#lx minimum size %dx%d", t->main, hints.min_width,
+           hints.min_height);
+}
+
+/*
+ * WeCom answered a resize with a surface that is larger than the X window:
+ * the layout is still bw x bh and only its left/top part is visible.  Growing
+ * the window to the surface size is the only way to get the right edge - with
+ * the minimize/maximize/close strip in it - back on screen.
+ */
+static void main_grow_to_surface(Target *t, const Rect *m, int bw, int bh)
+{
+    int nw = bw > m->w ? bw : m->w;
+    int nh = bh > m->h ? bh : m->h;
+    int screen_w = DisplayWidth(dpy, DefaultScreen(dpy));
+    int screen_h = DisplayHeight(dpy, DefaultScreen(dpy));
+
+    if (win_is_maximized(t->main)) {
+        return;
+    }
+    /*
+     * While the user drags or resizes the frame, the client shape trails the
+     * new geometry for a few frames.  Growing the window then would fight the
+     * drag and could record a transient size as WeCom's minimum.
+     */
+    if (now_ms() - t->last_config_ms < GROW_SETTLE_MS) {
+        return;
+    }
+    /*
+     * Give Wine a moment to re-assert its own size first.  A shape that is
+     * briefly wider than the window during a resize is normal; only one that
+     * sticks around means WeCom really kept the larger surface.
+     */
+    if (t->stale_bw != bw || t->stale_bh != bh) {
+        t->stale_bw = bw;
+        t->stale_bh = bh;
+        t->stale_since_ms = now_ms();
+        return;
+    }
+    if (now_ms() - t->stale_since_ms < GROW_SETTLE_MS) {
+        return;
+    }
+    if (bw > m->w && bw - m->w <= MAIN_GROW_MAX && bw > t->min_w) {
+        t->min_w = bw;
+    }
+    if (bh > m->h && bh - m->h <= MAIN_GROW_MAX && bh > t->min_h) {
+        t->min_h = bh;
+    }
+    apply_min_size_hints(t, m);
+    if (nw > screen_w - m->x) {
+        nw = screen_w - m->x;
+    }
+    if (nh > screen_h - m->y) {
+        nh = screen_h - m->y;
+    }
+    if (nw <= m->w && nh <= m->h) {
+        return;
+    }
+    if (now_ms() - t->last_grow_ms < 1000) {
+        return;
+    }
+    t->last_grow_ms = now_ms();
+    XMoveResizeWindow(dpy, t->main, m->x, m->y, (unsigned)nw, (unsigned)nh);
+    XFlush(dpy);
+    logmsg("main %#lx grown from %dx%d to %dx%d to match its surface", t->main,
+           m->w, m->h, nw, nh);
+    assign_overlays();
+}
+
+/*
+ * Stretch a stale mask onto the current window size.  Every rectangle keeps
+ * its distance to the four old edges, so the rounded corners of WeCom's own
+ * mask survive and the straight middle grows or shrinks as a whole.
+ */
+static void main_shape_stretch(Target *t, const Rect *m, int bw, int bh)
+{
+    int count = 0, ordering = 0, out = 0;
+    XRectangle *rects;
+    XRectangle *want;
+    XserverRegion region;
+
+    rects = XShapeGetRectangles(dpy, t->main, ShapeBounding, &count, &ordering);
+    if (rects == NULL || count <= 0) {
+        if (rects != NULL) {
+            XFree(rects);
+        }
+        return;
+    }
+    want = malloc(sizeof(*want) * (size_t)count);
+    if (want == NULL) {
+        XFree(rects);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        int left = rects[i].x;
+        int top = rects[i].y;
+        int right = bw - ((int)rects[i].x + (int)rects[i].width);
+        int bottom = bh - ((int)rects[i].y + (int)rects[i].height);
+        int w = m->w - left - right;
+        int h = m->h - top - bottom;
+
+        if (left < 0) {
+            left = 0;
+        }
+        if (top < 0) {
+            top = 0;
+        }
+        if (w <= 0 || h <= 0) {
+            continue;
+        }
+        want[out].x = (short)left;
+        want[out].y = (short)top;
+        want[out].width = (unsigned short)w;
+        want[out].height = (unsigned short)h;
+        out++;
+    }
+    XFree(rects);
+    if (out <= 0) {
+        free(want);
+        return;
+    }
+    region = XFixesCreateRegion(dpy, want, out);
+    XFixesSetWindowShapeRegion(dpy, t->main, ShapeBounding, 0, 0, region);
+    XFixesSetWindowShapeRegion(dpy, t->main, ShapeInput, 0, 0, region);
+    XFixesDestroyRegion(dpy, region);
+    XFlush(dpy);
+    free(want);
+    logmsg("shape of main %#lx stretched from %dx%d to %dx%d", t->main,
+           bw, bh, m->w, m->h);
+}
+
+/*
+ * Wine only rewrites the bounding shape of a layered window when it flushes
+ * that window's surface.  A resize can reach the X server while Wine keeps
+ * its surface at the old size; xfwm4 copies that shape onto the frame, so
+ * everything outside it is clipped away and the window appears to lose its
+ * right edge.  Which side is stale decides the repair: a smaller shape is
+ * stretched over the window, a larger shape means WeCom refused the shrink
+ * and the window has to grow back to it.
+ */
+static void main_shape_reconcile(Target *t)
+{
+    Rect m;
+    int bw = 0, bh = 0;
+
+    if (!t->valid || !win_rect(t->main, &m)) {
+        return;
+    }
+    if (!shape_bounds(t->main, &bw, &bh)) {
+        return;
+    }
+    apply_min_size_hints(t, &m);
+    if (bw > m.w + 8 || bh > m.h + 8) {
+        main_grow_to_surface(t, &m, bw, bh);
+        return;
+    }
+    t->stale_bw = 0;
+    t->stale_since_ms = 0;
+    if (abs(bw - m.w) <= 2 && abs(bh - m.h) <= 2) {
+        return;
+    }
+    main_shape_stretch(t, &m, bw, bh);
+}
+
 /*
  * Cheap check used by the watchdog: only asks the server what the window's
  * shape is now and compares it with the list we last applied.  Recomputing
@@ -519,6 +811,27 @@ static int overlay_shape_intact(const Overlay *o)
     return window_shape_is(o->win, o->applied, o->applied_count);
 }
 
+static int overlay_capture_base(Overlay *o);
+
+/*
+ * True when the window's current bounding shape already covers exactly the
+ * window's own rectangle.  Such a shape can only be the one Wine recomputed
+ * for the current geometry, so it is safe to capture it as the new base.
+ */
+static int shape_matches_window(Window win, const Rect *s)
+{
+    int count = 0, ordering = 0, bw = 0, bh = 0;
+    XRectangle *rects =
+        XShapeGetRectangles(dpy, win, ShapeBounding, &count, &ordering);
+
+    if (rects == NULL) {
+        return 0;
+    }
+    shape_bbox(rects, count, &bw, &bh);
+    XFree(rects);
+    return count > 0 && bw == s->w && bh == s->h;
+}
+
 static void overlay_apply_shape(Target *t, Overlay *o)
 {
     Rect s;
@@ -528,6 +841,21 @@ static void overlay_apply_shape(Target *t, Overlay *o)
 
     if (!win_rect(o->win, &s)) {
         return;
+    }
+    if (o->base_w != s.w || o->base_h != s.h) {
+        if (shape_matches_window(o->win, &s)) {
+            overlay_capture_base(o);
+        } else {
+            /* The cached mask belongs to the old size; a plain rectangle is
+               correct until Wine rewrites the shape for the new one. */
+            if (o->base != NULL) {
+                XFree(o->base);
+            }
+            o->base = NULL;
+            o->base_count = 0;
+            o->base_w = s.w;
+            o->base_h = s.h;
+        }
     }
     region = overlay_base_region(o, &s);
     nholes = collect_occluders(t, &s, holes, MAX_HOLES);
@@ -834,6 +1162,11 @@ static void glue_ring(Target *t)
  * while Wine is still one pointer event behind.  Only strip-shaped overlays
  * (as wide as the window, at its top edge) are moved; small widgets are
  * positioned by WeCom itself.
+ *
+ * A strip that has not caught up with a resize is still a strip: it starts at
+ * the window's top left corner and spans most of its width.  Those are glued
+ * to the new width as well, which is what brings the "-[]X" buttons back
+ * after unmaximizing, when Wine still draws them at the old right edge.
  */
 static void glue_overlays(Target *t)
 {
@@ -850,7 +1183,11 @@ static void glue_overlays(Target *t)
         if (!win_rect(o->win, &s)) {
             continue;
         }
-        if (s.h > STRIP_MAX_HEIGHT || abs(s.w - m.w) > 64) {
+        if (s.h > STRIP_MAX_HEIGHT) {
+            continue;
+        }
+        if (abs(s.w - m.w) > 64 &&
+            !(s.x == m.x && s.y == m.y && s.w >= m.w / 2)) {
             continue;
         }
         dx = m.x - s.x;
@@ -868,7 +1205,14 @@ static void glue_overlays(Target *t)
 /*
  * A known shadow window stays tracked even when it lags behind the main
  * window, as long as it is still the same kind of window.  The real position
- * is corrected later by glue_ring().
+ * and size are corrected later by glue_ring().
+ *
+ * The old version demanded that the shadow's size was already within 64 px of
+ * the main window's.  After a maximize/unmaximize round trip the shadow can be
+ * a whole layout strip off, and dropping it there meant it was never glued
+ * back - so the white border trailed the window again and the shadow's owner
+ * stayed untracked until Wine happened to redraw it.  Only identity and a
+ * rough position check remain; anything else is glue's job.
  */
 static int ring_still_valid(Target *t, const Rect *m)
 {
@@ -890,8 +1234,8 @@ static int ring_still_valid(Target *t, const Rect *m)
     if (!win_rect(t->ring, &r)) {
         return 0;
     }
-    if (abs(r.w - (m->w + 2 * t->ring_pad)) > 64 ||
-        abs(r.h - (m->h + 2 * t->ring_pad)) > 64) {
+    if (r.x >= m->x + m->w + 512 || r.y >= m->y + m->h + 512 ||
+        m->x >= r.x + r.w + 512 || m->y >= r.y + r.h + 512) {
         return 0;
     }
     t->ring_frame = win_top_level(t->ring);
@@ -1050,8 +1394,7 @@ static int overlay_is_popup(Window win)
  * window whose top right corner they sit closest to, because WeCom anchors
  * them at their owner's top edge.
  */
-static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
-                                const Rect *r)
+static int overlay_still_valid(Window win, Target *t)
 {
     XWindowAttributes attr;
 
@@ -1070,6 +1413,18 @@ static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
     if (t->pid != 0 && win_pid(win) != t->pid) {
         return 0;
     }
+    if (overlay_is_popup(win)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
+                                const Rect *r)
+{
+    if (!overlay_still_valid(win, t)) {
+        return 0;
+    }
     if (r->w * r->h < OVERLAY_MIN_AREA || r->h > OVERLAY_MAX_HEIGHT) {
         return 0;
     }
@@ -1080,10 +1435,45 @@ static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
         r->y + r->h > m->y + m->h + OVERLAY_SLACK) {
         return 0;
     }
-    if (overlay_is_popup(win)) {
-        return 0;
-    }
     return 1;
+}
+
+/*
+ * An overlay that is already attached stays attached, even when its geometry
+ * still describes the window's previous size.  Matching by geometry instead
+ * dropped the title bar strip the moment the main window shrank - the strip
+ * hangs over the new right edge by the whole size difference - after which
+ * nothing glued it back and the "-[]X" buttons stayed at the old, invisible
+ * position.  Identity (same process, same window class, same override-redirect
+ * strip) is what decides, and glue_overlays() corrects the geometry.
+ */
+static int overlay_keep_known(Window win, const Rect *r)
+{
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+        Rect m;
+
+        if (!t->valid || !win_rect(t->main, &m)) {
+            continue;
+        }
+        for (int j = 0; j < t->overlay_count; j++) {
+            Overlay *o = &t->overlays[j];
+
+            if (o->win != win) {
+                continue;
+            }
+            if (!overlay_still_valid(win, t)) {
+                return 0;
+            }
+            if (r->x >= m.x + m.w + 512 || r->y >= m.y + m.h + 512 ||
+                m.x >= r->x + r->w + 512 || m.y >= r->y + r->h + 512) {
+                return 0;
+            }
+            o->seen = 1;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int overlay_capture_base(Overlay *o)
@@ -1095,6 +1485,8 @@ static int overlay_capture_base(Overlay *o)
 
     o->base = NULL;
     o->base_count = 0;
+    o->base_w = 0;
+    o->base_h = 0;
     if (!win_rect(o->win, &s)) {
         return 0;
     }
@@ -1114,6 +1506,8 @@ static int overlay_capture_base(Overlay *o)
     }
     o->base = rects;
     o->base_count = count;
+    o->base_w = s.w;
+    o->base_h = s.h;
     return 1;
 }
 
@@ -1131,6 +1525,9 @@ static void overlay_free(Overlay *o)
 static void classify(Target *t)
 {
     Rect m;
+    XWindowAttributes attr;
+    Window keep_ring;
+    int keep_pad;
 
     if (!win_rect(t->main, &m)) {
         return;
@@ -1138,17 +1535,36 @@ static void classify(Target *t)
     if (t->ring_pad == 0) {
         t->ring_pad = 18;
     }
-    if (!ring_still_valid(t, &m)) {
-        /* The old shadow is gone or no longer matches; undo its shape first. */
-        ring_shape_drop(t, 1);
-        find_ring(t, &m);
-        if (t->ring != None) {
+    if (ring_still_valid(t, &m)) {
+        if (t->ring_shape.win != t->ring || !t->ring_shape.captured) {
+            ring_shape_drop(t, 0);
             ring_shape_capture(t);
         }
-    } else if (t->ring_shape.win != t->ring || !t->ring_shape.captured) {
-        ring_shape_drop(t, 0);
-        ring_shape_capture(t);
+        return;
     }
+
+    /*
+     * WeCom unmaps the shadow while the window is maximized and may leave it
+     * at the old size for a moment afterwards.  Forget the reference only when
+     * the window is really gone; otherwise keep it and let glue_ring() pull it
+     * to the current geometry once it is back.
+     */
+    keep_ring = t->ring;
+    keep_pad = t->ring_pad;
+    find_ring(t, &m);
+    if (t->ring != None) {
+        ring_shape_capture(t);
+        return;
+    }
+    if (keep_ring != None &&
+        XGetWindowAttributes(dpy, keep_ring, &attr)) {
+        t->ring = keep_ring;
+        t->ring_frame = win_top_level(keep_ring);
+        t->ring_pad = keep_pad;
+        return;
+    }
+    ring_shape_drop(t, 1);
+    t->ring_frame = None;
 }
 
 /*
@@ -1192,6 +1608,9 @@ static void assign_overlays(void)
         int best_score = 0;
 
         if (!win_rect(win, &r)) {
+            continue;
+        }
+        if (overlay_keep_known(win, &r)) {
             continue;
         }
         for (int i = 0; i < MAX_TARGETS; i++) {
@@ -1418,6 +1837,7 @@ static void scan(void)
         slot->valid = 1;
         if (!was_valid) {
             hot_until = now_ms() + HOT_WINDOW_MS;
+            slot->last_config_ms = now_ms();
         }
         classify(slot);
 
@@ -1445,6 +1865,7 @@ static void reconcile_shape(Target *t)
     if (!t->valid) {
         return;
     }
+    main_shape_reconcile(t);
     ring_apply_shape(t);
     for (int i = 0; i < t->overlay_count; i++) {
         overlay_apply_shape(t, &t->overlays[i]);
@@ -1576,6 +1997,11 @@ int main(int argc, char **argv)
     root = DefaultRootWindow(dpy);
 
     atom_wm_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    atom_wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    atom_wm_state_maximized_vert =
+        XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_VERT", False);
+    atom_wm_state_maximized_horz =
+        XInternAtom(dpy, "_NET_WM_STATE_MAXIMIZED_HORZ", False);
     atom_wm_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
     atom_wm_window_type_normal =
         XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_NORMAL", False);
@@ -1664,6 +2090,7 @@ int main(int argc, char **argv)
                     }
                     if (ev.xconfigure.window == targets[i].frame ||
                         ev.xconfigure.window == targets[i].main) {
+                        targets[i].last_config_ms = now_ms();
                         if (!dry_run) {
                             glue_ring(&targets[i]);
                             glue_overlays(&targets[i]);
@@ -1710,6 +2137,7 @@ int main(int argc, char **argv)
                 if (!t->valid) {
                     continue;
                 }
+                main_shape_reconcile(t);
                 for (int j = 0; j < t->overlay_count; j++) {
                     if (!overlay_shape_intact(&t->overlays[j])) {
                         shape_dirty = 1;
