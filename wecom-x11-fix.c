@@ -87,6 +87,7 @@ static const char *const wecom_names[] = {
 #define GROW_SETTLE_MS 800.0
 #define STRIP_MAX_HEIGHT 64
 #define OVERLAY_MAX_HEIGHT 64
+#define OVERLAY_BUTTON_WIDTH 120
 #define OVERLAY_SLACK 64
 #define OVERLAY_MIN_AREA 64
 #define MAX_OVERLAYS 8
@@ -123,9 +124,12 @@ typedef struct {
     int base_h;
     XRectangle *applied;
     int applied_count;
+    XRectangle *applied_input;
+    int applied_input_count;
     int seen;
     int managed;
     int click_through;
+    int button_strip;
     double applied_ms;
 } Overlay;
 
@@ -142,6 +146,7 @@ typedef struct {
     int base_input_count;
     XRectangle *applied;
     int applied_count;
+    int base_w, base_h;
     int captured;
     double applied_ms;
 } RingShape;
@@ -503,6 +508,48 @@ static XserverRegion overlay_base_region(const Overlay *o, const Rect *s)
     return overlay_full_region(s);
 }
 
+/*
+ * The base shape Wine gave an overlay can be larger than the overlay's own
+ * window rectangle.  After a maximize/unmaximize round trip the title bar
+ * shadow is often left at the old surface size for a moment, so clipping only
+ * the window rectangle would leave the part outside it untouched and still
+ * visible above the window that covers the owner.  Use the union of both
+ * rectangles as the area that has to be tested against occluders.
+ */
+static void overlay_region_bounds(const Overlay *o, const Rect *s, Rect *out)
+{
+    int min_x = 0, min_y = 0, max_x = s->w, max_y = s->h;
+
+    if (o->base_count > 0 && o->base != NULL) {
+        for (int i = 0; i < o->base_count; i++) {
+            int x0 = o->base[i].x;
+            int y0 = o->base[i].y;
+            int x1 = x0 + (int)o->base[i].width;
+            int y1 = y0 + (int)o->base[i].height;
+
+            if (x0 < min_x) {
+                min_x = x0;
+            }
+            if (y0 < min_y) {
+                min_y = y0;
+            }
+            if (x1 > max_x) {
+                max_x = x1;
+            }
+            if (y1 > max_y) {
+                max_y = y1;
+            }
+        }
+    }
+    out->x = s->x + min_x;
+    out->y = s->y + min_y;
+    out->w = max_x - min_x;
+    out->h = max_y - min_y;
+    if (out->w <= 0 || out->h <= 0) {
+        *out = *s;
+    }
+}
+
 static int rect_lists_equal(const XRectangle *a, int na, const XRectangle *b,
                             int nb)
 {
@@ -572,6 +619,19 @@ static int bounding_shape_is(Window win, const XRectangle *want, int nwant)
     return match;
 }
 
+static int input_shape_is(Window win, const XRectangle *want, int nwant)
+{
+    int ninput = 0, ordering = 0;
+    XRectangle *input =
+        XShapeGetRectangles(dpy, win, ShapeInput, &ninput, &ordering);
+    int match = input != NULL && rect_lists_equal(want, nwant, input, ninput);
+
+    if (input != NULL) {
+        XFree(input);
+    }
+    return match;
+}
+
 static void shape_bbox(const XRectangle *rects, int count, int *out_w,
                        int *out_h)
 {
@@ -619,6 +679,84 @@ static int overlay_shape_exceeds_window(Window win, const Rect *r)
         return 0;
     }
     return bw > r->w || bh > r->h;
+}
+
+static unsigned int channel_to_8bit(unsigned long pixel, unsigned long mask)
+{
+    int shift = 0;
+    unsigned long max;
+
+    if (mask == 0) {
+        return 0;
+    }
+    while ((mask & 1UL) == 0) {
+        mask >>= 1;
+        shift++;
+    }
+    max = mask;
+    return max == 0 ? 0 : (unsigned int)(((pixel & mask) >> shift) * 255 / max);
+}
+
+#define OVERLAY_KIND_OTHER 0
+#define OVERLAY_KIND_SHADOW 1
+#define OVERLAY_KIND_BUTTONS 2
+
+/*
+ * The title bar helper can be a pure shadow strip (near-black, alpha around
+ * one) or the strip that also paints the caption buttons (opaque glyphs with
+ * a much higher alpha).  Only the pure shadow may be made click-through: the
+ * button strip has to receive the clicks itself, otherwise they fall through
+ * to the owner's caption and turn into a window drag.
+ */
+static int overlay_content_kind(Window win)
+{
+    XWindowAttributes attr;
+    XImage *img;
+    unsigned int brightest = 0;
+    unsigned int max_alpha = 0;
+    int step_x, step_y;
+
+    if (!XGetWindowAttributes(dpy, win, &attr)) {
+        return OVERLAY_KIND_OTHER;
+    }
+    if (attr.map_state != IsViewable || attr.depth != 32 || attr.width <= 0 ||
+        attr.height <= 0) {
+        return OVERLAY_KIND_OTHER;
+    }
+    img = XGetImage(dpy, win, 0, 0, attr.width, attr.height, AllPlanes,
+                    ZPixmap);
+    if (img == NULL) {
+        return OVERLAY_KIND_OTHER;
+    }
+    step_x = attr.width > 128 ? attr.width / 128 : 1;
+    step_y = attr.height > 32 ? attr.height / 32 : 1;
+    for (int y = 0; y < attr.height; y += step_y) {
+        for (int x = 0; x < attr.width; x += step_x) {
+            unsigned long pixel = XGetPixel(img, x, y);
+            unsigned int alpha = (unsigned int)(pixel >> 24) & 0xffu;
+            unsigned int r = channel_to_8bit(pixel, img->red_mask);
+            unsigned int g = channel_to_8bit(pixel, img->green_mask);
+            unsigned int b = channel_to_8bit(pixel, img->blue_mask);
+
+            if (alpha > max_alpha) {
+                max_alpha = alpha;
+            }
+            if (r > brightest) {
+                brightest = r;
+            }
+            if (g > brightest) {
+                brightest = g;
+            }
+            if (b > brightest) {
+                brightest = b;
+            }
+        }
+    }
+    XDestroyImage(img);
+    if (max_alpha > 32) {
+        return OVERLAY_KIND_BUTTONS;
+    }
+    return brightest <= 64 ? OVERLAY_KIND_SHADOW : OVERLAY_KIND_OTHER;
 }
 
 static void assign_overlays(void);
@@ -845,12 +983,36 @@ static void main_shape_reconcile(Target *t)
  */
 static int overlay_shape_intact(const Overlay *o)
 {
+    XWindowAttributes attr;
+    int viewable;
+
     if (o->applied == NULL) {
+        return 0;
+    }
+    if (!XGetWindowAttributes(dpy, o->win, &attr)) {
+        return 0;
+    }
+    viewable = attr.map_state == IsViewable;
+    /*
+     * A fully covered helper is unmapped rather than clipped to nothing.
+     * Shape changes alone do not make the compositor repaint the pixels the
+     * helper used to cover, so the old title bar would stay on screen above
+     * whatever window was raised over it.
+     */
+    if (o->applied_count == 0) {
+        return !viewable;
+    }
+    if (!viewable) {
         return 0;
     }
     if (o->click_through) {
         return input_shape_empty(o->win) &&
                bounding_shape_is(o->win, o->applied, o->applied_count);
+    }
+    if (o->button_strip) {
+        return bounding_shape_is(o->win, o->applied, o->applied_count) &&
+               input_shape_is(o->win, o->applied_input,
+                              o->applied_input_count);
     }
     return window_shape_is(o->win, o->applied, o->applied_count);
 }
@@ -878,7 +1040,7 @@ static int shape_matches_window(Window win, const Rect *s)
 
 static void overlay_apply_shape(Target *t, Overlay *o)
 {
-    Rect s;
+    Rect s, bounds;
     XRectangle holes[MAX_HOLES];
     int nholes;
     XserverRegion region, input_region;
@@ -908,20 +1070,90 @@ static void overlay_apply_shape(Target *t, Overlay *o)
         }
     }
     region = overlay_base_region(o, &s);
-    anchor = o->frame != None ? o->frame : win_top_level(o->win);
-    nholes = collect_occluders(t, anchor, &s, holes, MAX_HOLES);
+    /*
+     * Override-redirect helpers are raised above every other top-level, so
+     * their own stacking position says nothing about what covers the owner.
+     * Clip them by the windows above the owner frame instead.  Managed helpers
+     * have normal stacking and are clipped by the windows above their own
+     * frame.
+     */
+    if (o->managed) {
+        anchor = o->frame != None ? o->frame : win_top_level(o->win);
+    } else {
+        anchor = t->frame;
+    }
+    overlay_region_bounds(o, &s, &bounds);
+    nholes = collect_occluders(t, anchor, &bounds, holes, MAX_HOLES);
     if (nholes > 0) {
+        for (int i = 0; i < nholes; i++) {
+            holes[i].x = (short)(holes[i].x + bounds.x - s.x);
+            holes[i].y = (short)(holes[i].y + bounds.y - s.y);
+        }
         XserverRegion covered = XFixesCreateRegion(dpy, holes, nholes);
         XFixesSubtractRegion(dpy, region, region, covered);
         XFixesDestroyRegion(dpy, covered);
     }
     int nwant = 0;
     XRectangle *want = XFixesFetchRegion(dpy, region, &nwant);
+    XWindowAttributes attr;
+    int viewable = XGetWindowAttributes(dpy, o->win, &attr) &&
+                   attr.map_state == IsViewable;
+
+    if (want == NULL || nwant == 0) {
+        /*
+         * Nothing of the helper is visible.  Clipping alone leaves the
+         * compositor holding the pixels it last painted there, which is what
+         * makes the caption buttons appear above a window that was raised
+         * over WeCom.  Unmapping forces the area to be recomposited.
+         */
+        if (viewable) {
+            XUnmapWindow(dpy, o->win);
+            XFlush(dpy);
+        }
+        if (want != NULL) {
+            if (o->applied != NULL) {
+                XFree(o->applied);
+            }
+            o->applied = want;
+            o->applied_count = 0;
+        }
+        if (o->applied_input != NULL) {
+            XFree(o->applied_input);
+        }
+        o->applied_input = NULL;
+        o->applied_input_count = 0;
+        XFixesDestroyRegion(dpy, region);
+        return;
+    }
+    if (!viewable) {
+        XMapWindow(dpy, o->win);
+        XFlush(dpy);
+    }
 
     if (o->click_through) {
         XRectangle empty = {0, 0, 0, 0};
 
         input_region = XFixesCreateRegion(dpy, &empty, 1);
+    } else if (o->button_strip) {
+        /*
+         * Only the rightmost band paints the caption buttons.  Keeping the
+         * rest of the strip input-transparent preserves title bar dragging.
+         */
+        XRectangle buttons;
+        XserverRegion band;
+
+        buttons.x = (short)(s.w > OVERLAY_BUTTON_WIDTH
+                                ? s.w - OVERLAY_BUTTON_WIDTH
+                                : 0);
+        buttons.y = 0;
+        buttons.width = (unsigned short)(s.w > OVERLAY_BUTTON_WIDTH
+                                             ? OVERLAY_BUTTON_WIDTH
+                                             : s.w);
+        buttons.height = (unsigned short)s.h;
+        band = XFixesCreateRegion(dpy, &buttons, 1);
+        input_region = XFixesCreateRegion(dpy, want, nwant);
+        XFixesIntersectRegion(dpy, input_region, input_region, band);
+        XFixesDestroyRegion(dpy, band);
     } else {
         input_region = XFixesCreateRegion(dpy, want, nwant);
     }
@@ -929,7 +1161,12 @@ static void overlay_apply_shape(Target *t, Overlay *o)
         o->click_through
             ? input_shape_empty(o->win) &&
                   bounding_shape_is(o->win, want, nwant)
-            : input_region != None && window_shape_is(o->win, want, nwant);
+            : o->button_strip
+                  ? bounding_shape_is(o->win, want, nwant) &&
+                        input_shape_is(o->win, o->applied_input,
+                                       o->applied_input_count)
+                  : input_region != None &&
+                        window_shape_is(o->win, want, nwant);
 
     if (want != NULL && input_region != None && !input_ok) {
         XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
@@ -938,6 +1175,11 @@ static void overlay_apply_shape(Target *t, Overlay *o)
         o->applied_ms = now_ms();
     }
     if (input_region != None) {
+        if (o->applied_input != NULL) {
+            XFree(o->applied_input);
+        }
+        o->applied_input =
+            XFixesFetchRegion(dpy, input_region, &o->applied_input_count);
         XFixesDestroyRegion(dpy, input_region);
     }
     if (want != NULL) {
@@ -969,6 +1211,7 @@ static void overlay_restore(Target *t, Overlay *o)
     }
     XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
+    XMapWindow(dpy, o->win);
     XFlush(dpy);
 }
 
@@ -1039,6 +1282,7 @@ static void ring_shape_capture(Target *t)
     XRectangle *rects;
     XRectangle *input_rects;
     XRectangle full;
+    Rect ring_rect;
     int count = 0;
     int input_count = 0;
     int ordering = 0;
@@ -1048,9 +1292,17 @@ static void ring_shape_capture(Target *t)
         return;
     }
     rs->win = t->ring;
+    XShapeSelectInput(dpy, t->ring, ShapeNotifyMask);
+    if (win_rect(t->ring, &ring_rect)) {
+        rs->base_w = ring_rect.w;
+        rs->base_h = ring_rect.h;
+    }
     rects =
         XShapeGetRectangles(dpy, t->ring, ShapeBounding, &count, &ordering);
     if (rects == NULL) {
+        /* An empty shape is still a captured state: shaping falls back to the
+           window rectangle instead of leaving the ring untouched. */
+        rs->captured = 1;
         return;
     }
     window_full_rect(t->ring, &full);
@@ -1111,6 +1363,46 @@ static XserverRegion owner_shape_region(Window win, int dx, int dy, int w,
 }
 
 /*
+ * Wine only writes the shadow window's shape when it creates or repaints it.
+ * After a maximize/unmaximize round trip the server can still hold the shape
+ * we applied for the previous size, so a freshly captured base may describe a
+ * window that no longer exists (its outer bands then fall outside the current
+ * rectangle and the border disappears).  A base is only usable when its
+ * bounding box matches the ring window we are shaping now.
+ */
+static int ring_base_matches(const RingShape *rs, const Rect *r)
+{
+    int min_x, min_y, max_x, max_y;
+
+    if (rs->base_count <= 0 || rs->base == NULL) {
+        return 0;
+    }
+    min_x = max_x = rs->base[0].x;
+    min_y = max_y = rs->base[0].y;
+    for (int i = 0; i < rs->base_count; i++) {
+        int x0 = rs->base[i].x;
+        int y0 = rs->base[i].y;
+        int x1 = x0 + (int)rs->base[i].width;
+        int y1 = y0 + (int)rs->base[i].height;
+
+        if (x0 < min_x) {
+            min_x = x0;
+        }
+        if (y0 < min_y) {
+            min_y = y0;
+        }
+        if (x1 > max_x) {
+            max_x = x1;
+        }
+        if (y1 > max_y) {
+            max_y = y1;
+        }
+    }
+    return min_x >= -2 && min_y >= -2 && max_x <= r->w + 2 &&
+           max_y <= r->h + 2 && max_x >= r->w - 2 && max_y >= r->h - 2;
+}
+
+/*
  * Keep only the part of the shadow that lies outside the owner window.  The
  * inner band of the shadow is painted opaque by Wine, so clipping it away is
  * what removes the white frame around dialogs.
@@ -1130,7 +1422,7 @@ static void ring_apply_shape(Target *t)
     if (!win_rect(t->main, &m) || !win_rect(rs->win, &r)) {
         return;
     }
-    if (rs->base_count > 0 && rs->base != NULL) {
+    if (ring_base_matches(rs, &r)) {
         region = XFixesCreateRegion(dpy, rs->base, rs->base_count);
     } else {
         window_full_rect(rs->win, &full);
@@ -1184,7 +1476,7 @@ static int ring_shape_intact(Target *t)
     if (!rs->captured || rs->applied == NULL) {
         return 0;
     }
-    return bounding_shape_is(rs->win, rs->applied, rs->applied_count);
+    return window_shape_is(rs->win, rs->applied, rs->applied_count);
 }
 
 static RingShape *find_ring_shape(Window win)
@@ -1653,6 +1945,9 @@ static void overlay_free(Overlay *o)
     if (o->applied != NULL) {
         XFree(o->applied);
     }
+    if (o->applied_input != NULL) {
+        XFree(o->applied_input);
+    }
     memset(o, 0, sizeof(*o));
 }
 
@@ -1670,7 +1965,21 @@ static void classify(Target *t)
         t->ring_pad = 18;
     }
     if (ring_still_valid(t, &m)) {
+        Rect r;
+
         if (t->ring_shape.win != t->ring || !t->ring_shape.captured) {
+            ring_shape_drop(t, 0);
+            ring_shape_capture(t);
+        } else if (win_rect(t->ring, &r) &&
+                   (t->ring_shape.base_w != r.w ||
+                    t->ring_shape.base_h != r.h) &&
+                   !window_shape_is(t->ring, t->ring_shape.applied,
+                                    t->ring_shape.applied_count)) {
+            /*
+             * The ring was resized and Wine has already written a new shape:
+             * the old base belongs to the previous geometry, so capture the
+             * fresh one before shaping again.
+             */
             ring_shape_drop(t, 0);
             ring_shape_capture(t);
         }
@@ -1760,9 +2069,14 @@ static void consider_overlay_candidate(Window win, unsigned int stack_index,
         int full_width_top = r.h <= OVERLAY_MAX_HEIGHT &&
                              r.w >= mains[best].w - OVERLAY_SLACK &&
                              abs(r.y - mains[best].y) <= 2;
+        int kind = full_width_top ? overlay_content_kind(win)
+                                  : OVERLAY_KIND_OTHER;
+
+        o->button_strip = kind == OVERLAY_KIND_BUTTONS;
         o->click_through =
-            full_width_top &&
-            (o->managed || overlay_shape_exceeds_window(win, &r));
+            full_width_top && !o->button_strip &&
+            (o->managed || overlay_shape_exceeds_window(win, &r) ||
+             kind == OVERLAY_KIND_SHADOW);
         if (overlay_capture_base(o)) {
             o->seen = 1;
             t->overlay_count++;
@@ -1798,7 +2112,16 @@ static void assign_overlays(void)
 
         frames[i] = -1;
         for (int j = 0; j < t->overlay_count; j++) {
-            t->overlays[j].seen = 0;
+            XWindowAttributes oa;
+
+            /*
+             * A helper we unmapped because it was fully covered is still a
+             * live window: keep tracking it so it can be mapped again when
+             * the owner comes back to the front.  Only a destroyed window is
+             * really gone.
+             */
+            t->overlays[j].seen =
+                XGetWindowAttributes(dpy, t->overlays[j].win, &oa) ? 1 : 0;
         }
         if (!t->valid || !win_rect(t->main, &mains[i])) {
             continue;
@@ -2125,19 +2448,24 @@ static void print_holes(void)
             continue;
         }
         for (int k = 0; k < t->overlay_count; k++) {
-            Rect s;
+            Rect s, bounds;
             XRectangle holes[MAX_HOLES];
             int n;
 
             if (!win_rect(t->overlays[k].win, &s)) {
                 continue;
             }
-            n = collect_occluders(t, t->overlays[k].frame, &s, holes,
-                                  MAX_HOLES);
+            Window anchor = t->overlays[k].managed
+                                ? t->overlays[k].frame
+                                : t->frame;
+            overlay_region_bounds(&t->overlays[k], &s, &bounds);
+            n = collect_occluders(t, anchor, &bounds, holes, MAX_HOLES);
             printf("overlay=%#lx %dx%d+%d+%d holes=%d\n",
                    t->overlays[k].win, s.w, s.h, s.x, s.y, n);
             for (int j = 0; j < n; j++) {
-                printf("  hole %d,%d %ux%u\n", holes[j].x, holes[j].y,
+                printf("  hole %d,%d %ux%u\n",
+                       holes[j].x + bounds.x - s.x,
+                       holes[j].y + bounds.y - s.y,
                        holes[j].width, holes[j].height);
             }
         }
