@@ -105,20 +105,27 @@ typedef struct {
 } Rect;
 
 /*
- * An override-redirect ARGB window that WeCom uses to draw part of its own
- * chrome.  base is the window's own bounding shape (rounded corners and the
- * like); it is kept so that shaping only ever removes pixels and so that the
- * original shape can be restored on exit.
+ * An ARGB helper window that WeCom uses to draw part of its own chrome or
+ * shadow.  Older Wine versions created these as override-redirect windows;
+ * newer ones make the title bar shadow a managed dialog, so both forms are
+ * tracked.  base/base_input are the shapes Wine gave the window; they are kept
+ * so that shaping only ever removes pixels and the original shapes can be
+ * restored on exit.
  */
 typedef struct {
     Window win;
+    Window frame;
     XRectangle *base;
     int base_count;
+    XRectangle *base_input;
+    int base_input_count;
     int base_w;
     int base_h;
     XRectangle *applied;
     int applied_count;
     int seen;
+    int managed;
+    int click_through;
     double applied_ms;
 } Overlay;
 
@@ -131,6 +138,8 @@ typedef struct {
     Window win;
     XRectangle *base;
     int base_count;
+    XRectangle *base_input;
+    int base_input_count;
     XRectangle *applied;
     int applied_count;
     int captured;
@@ -371,7 +380,7 @@ static int win_is_known_overlay(Window win)
             continue;
         }
         for (int j = 0; j < t->overlay_count; j++) {
-            if (t->overlays[j].win == win) {
+            if (t->overlays[j].win == win || t->overlays[j].frame == win) {
                 return 1;
             }
         }
@@ -397,16 +406,19 @@ static Overlay *find_overlay(Window win)
 }
 
 /*
- * Fill a hole list with the parts of an overlay rectangle that are covered by
- * windows stacked above the WeCom frame it belongs to.  Coordinates are
- * overlay-local.
+ * Fill a hole list with the parts of a window rectangle that are covered by
+ * windows stacked above anchor.  XQueryTree returns root children bottom to
+ * top, so only entries after the anchor's own top-level frame can occlude it.
+ * Anchoring at the window being shaped (rather than at the main frame) keeps
+ * windows between main and the shadow/overlay from being treated as if they
+ * were above it.  Coordinates are rect-local.
  */
-static int collect_occluders(Target *t, const Rect *rect, XRectangle *holes,
-                             int max_holes)
+static int collect_occluders(Target *t, Window anchor, const Rect *rect,
+                             XRectangle *holes, int max_holes)
 {
     Window root_ret, parent_ret, *top = NULL;
     unsigned int ntop = 0;
-    int above_frame = 0;
+    int anchor_index = -1;
     int n = 0;
 
     if (t->frame == None) {
@@ -416,15 +428,20 @@ static int collect_occluders(Target *t, const Rect *rect, XRectangle *holes,
         return 0;
     }
     for (unsigned int i = 0; i < ntop; i++) {
+        if (top[i] == anchor) {
+            anchor_index = (int)i;
+            break;
+        }
+    }
+    if (anchor_index < 0) {
+        if (top != NULL) {
+            XFree(top);
+        }
+        return 0;
+    }
+    for (unsigned int i = (unsigned int)anchor_index + 1; i < ntop; i++) {
         Window win = top[i];
 
-        if (win == t->frame) {
-            above_frame = 1;
-            continue;
-        }
-        if (!above_frame) {
-            continue;
-        }
         if (win_is_known_overlay(win) || win == t->ring_frame) {
             continue;
         }
@@ -528,6 +545,19 @@ static int window_shape_is(Window win, const XRectangle *want, int nwant)
     return match;
 }
 
+static int input_shape_empty(Window win)
+{
+    int count = 0, ordering = 0;
+    XRectangle *rects =
+        XShapeGetRectangles(dpy, win, ShapeInput, &count, &ordering);
+    int empty = count == 0;
+
+    if (rects != NULL) {
+        XFree(rects);
+    }
+    return empty;
+}
+
 static int bounding_shape_is(Window win, const XRectangle *want, int nwant)
 {
     int nbound = 0, ordering = 0;
@@ -579,6 +609,16 @@ static int shape_bounds(Window win, int *out_w, int *out_h)
     *out_w = w;
     *out_h = h;
     return 1;
+}
+
+static int overlay_shape_exceeds_window(Window win, const Rect *r)
+{
+    int bw = 0, bh = 0;
+
+    if (!shape_bounds(win, &bw, &bh)) {
+        return 0;
+    }
+    return bw > r->w || bh > r->h;
 }
 
 static void assign_overlays(void);
@@ -808,6 +848,10 @@ static int overlay_shape_intact(const Overlay *o)
     if (o->applied == NULL) {
         return 0;
     }
+    if (o->click_through) {
+        return input_shape_empty(o->win) &&
+               bounding_shape_is(o->win, o->applied, o->applied_count);
+    }
     return window_shape_is(o->win, o->applied, o->applied_count);
 }
 
@@ -837,7 +881,8 @@ static void overlay_apply_shape(Target *t, Overlay *o)
     Rect s;
     XRectangle holes[MAX_HOLES];
     int nholes;
-    XserverRegion region;
+    XserverRegion region, input_region;
+    Window anchor;
 
     if (!win_rect(o->win, &s)) {
         return;
@@ -851,14 +896,20 @@ static void overlay_apply_shape(Target *t, Overlay *o)
             if (o->base != NULL) {
                 XFree(o->base);
             }
+            if (o->base_input != NULL) {
+                XFree(o->base_input);
+            }
             o->base = NULL;
             o->base_count = 0;
+            o->base_input = NULL;
+            o->base_input_count = 0;
             o->base_w = s.w;
             o->base_h = s.h;
         }
     }
     region = overlay_base_region(o, &s);
-    nholes = collect_occluders(t, &s, holes, MAX_HOLES);
+    anchor = o->frame != None ? o->frame : win_top_level(o->win);
+    nholes = collect_occluders(t, anchor, &s, holes, MAX_HOLES);
     if (nholes > 0) {
         XserverRegion covered = XFixesCreateRegion(dpy, holes, nholes);
         XFixesSubtractRegion(dpy, region, region, covered);
@@ -867,11 +918,27 @@ static void overlay_apply_shape(Target *t, Overlay *o)
     int nwant = 0;
     XRectangle *want = XFixesFetchRegion(dpy, region, &nwant);
 
-    if (want != NULL && !window_shape_is(o->win, want, nwant)) {
+    if (o->click_through) {
+        XRectangle empty = {0, 0, 0, 0};
+
+        input_region = XFixesCreateRegion(dpy, &empty, 1);
+    } else {
+        input_region = XFixesCreateRegion(dpy, want, nwant);
+    }
+    int input_ok =
+        o->click_through
+            ? input_shape_empty(o->win) &&
+                  bounding_shape_is(o->win, want, nwant)
+            : input_region != None && window_shape_is(o->win, want, nwant);
+
+    if (want != NULL && input_region != None && !input_ok) {
         XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
-        XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
+        XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, input_region);
         XFlush(dpy);
         o->applied_ms = now_ms();
+    }
+    if (input_region != None) {
+        XFixesDestroyRegion(dpy, input_region);
     }
     if (want != NULL) {
         if (o->applied != NULL) {
@@ -895,7 +962,11 @@ static void overlay_restore(Target *t, Overlay *o)
     region = overlay_base_region(o, &s);
     XFixesSetWindowShapeRegion(dpy, o->win, ShapeBounding, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
-    region = overlay_full_region(&s);
+    if (o->base_input_count > 0 && o->base_input != NULL) {
+        region = XFixesCreateRegion(dpy, o->base_input, o->base_input_count);
+    } else {
+        region = overlay_full_region(&s);
+    }
     XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
     XFlush(dpy);
@@ -932,6 +1003,14 @@ static void ring_shape_restore(Target *t)
         XShapeCombineRectangles(dpy, rs->win, ShapeBounding, 0, 0, &full, 1,
                                 ShapeSet, Unsorted);
     }
+    if (rs->base_input_count > 0 && rs->base_input != NULL) {
+        XShapeCombineRectangles(dpy, rs->win, ShapeInput, 0, 0, rs->base_input,
+                                rs->base_input_count, ShapeSet, Unsorted);
+    } else {
+        window_full_rect(rs->win, &full);
+        XShapeCombineRectangles(dpy, rs->win, ShapeInput, 0, 0, &full, 1,
+                                ShapeSet, Unsorted);
+    }
     XFlush(dpy);
 }
 
@@ -945,6 +1024,9 @@ static void ring_shape_drop(Target *t, int restore)
     if (rs->base != NULL) {
         XFree(rs->base);
     }
+    if (rs->base_input != NULL) {
+        XFree(rs->base_input);
+    }
     if (rs->applied != NULL) {
         XFree(rs->applied);
     }
@@ -955,8 +1037,10 @@ static void ring_shape_capture(Target *t)
 {
     RingShape *rs = &t->ring_shape;
     XRectangle *rects;
+    XRectangle *input_rects;
     XRectangle full;
     int count = 0;
+    int input_count = 0;
     int ordering = 0;
 
     ring_shape_drop(t, 0);
@@ -978,6 +1062,14 @@ static void ring_shape_capture(Target *t)
     }
     rs->base = rects;
     rs->base_count = count;
+    input_rects = XShapeGetRectangles(dpy, t->ring, ShapeInput, &input_count,
+                                      &ordering);
+    if (input_rects != NULL && input_count > 0) {
+        rs->base_input = input_rects;
+        rs->base_input_count = input_count;
+    } else if (input_rects != NULL) {
+        XFree(input_rects);
+    }
     rs->captured = 1;
 }
 
@@ -1061,7 +1153,7 @@ static void ring_apply_shape(Target *t)
      * stacked above the owner as well.
      */
     XRectangle holes[MAX_HOLES];
-    int nholes = collect_occluders(t, &r, holes, MAX_HOLES);
+    int nholes = collect_occluders(t, t->ring_frame, &r, holes, MAX_HOLES);
     if (nholes > 0) {
         cut = XFixesCreateRegion(dpy, holes, nholes);
         XFixesSubtractRegion(dpy, region, region, cut);
@@ -1069,8 +1161,9 @@ static void ring_apply_shape(Target *t)
     }
 
     want = XFixesFetchRegion(dpy, region, &nwant);
-    if (want != NULL && !bounding_shape_is(rs->win, want, nwant)) {
+    if (want != NULL && !window_shape_is(rs->win, want, nwant)) {
         XFixesSetWindowShapeRegion(dpy, rs->win, ShapeBounding, 0, 0, region);
+        XFixesSetWindowShapeRegion(dpy, rs->win, ShapeInput, 0, 0, region);
         XFlush(dpy);
         rs->applied_ms = now_ms();
     }
@@ -1389,19 +1482,21 @@ static int overlay_is_popup(Window win)
 }
 
 /*
- * Small override-redirect ARGB windows of the same process are WeCom's own
- * chrome (title bar strip, "more" button, ...).  They are matched to the
- * window whose top right corner they sit closest to, because WeCom anchors
- * them at their owner's top edge.
+ * Small ARGB windows of the same process are WeCom's own chrome (title bar
+ * strip, "more" button, ...).  Older Wine versions make them override-redirect;
+ * newer ones wrap the title bar shadow in a managed dialog with
+ * WM_TRANSIENT_FOR pointing at the main window.  Both forms are matched to the
+ * window whose top right corner they sit closest to.
  */
 static int overlay_still_valid(Window win, Target *t)
 {
     XWindowAttributes attr;
+    Window trans = None;
 
     if (!XGetWindowAttributes(dpy, win, &attr)) {
         return 0;
     }
-    if (!attr.override_redirect || attr.map_state != IsViewable) {
+    if (attr.map_state != IsViewable) {
         return 0;
     }
     if (attr.depth != 32 || win == t->main || win == t->ring) {
@@ -1416,12 +1511,22 @@ static int overlay_still_valid(Window win, Target *t)
     if (overlay_is_popup(win)) {
         return 0;
     }
+    if (!attr.override_redirect) {
+        if (!XGetTransientForHint(dpy, win, &trans)) {
+            return 0;
+        }
+        if (trans != t->main && trans != t->frame) {
+            return 0;
+        }
+    }
     return 1;
 }
 
 static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
                                 const Rect *r)
 {
+    XWindowAttributes attr;
+
     if (!overlay_still_valid(win, t)) {
         return 0;
     }
@@ -1434,6 +1539,20 @@ static int overlay_candidate_ok(Window win, Target *t, const Rect *m,
     if (r->x + r->w > m->x + m->w + OVERLAY_SLACK ||
         r->y + r->h > m->y + m->h + OVERLAY_SLACK) {
         return 0;
+    }
+    if (!XGetWindowAttributes(dpy, win, &attr)) {
+        return 0;
+    }
+    if (!attr.override_redirect) {
+        /*
+         * Managed helper windows are only interesting as the full-width title
+         * bar shadow strip.  Other WeCom dialogs are transient for the main
+         * window too, so keep the geometry test strict.
+         */
+        if (r->h > OVERLAY_MAX_HEIGHT || r->w < m->w - OVERLAY_SLACK ||
+            abs(r->y - m->y) > 2) {
+            return 0;
+        }
     }
     return 1;
 }
@@ -1479,16 +1598,28 @@ static int overlay_keep_known(Window win, const Rect *r)
 static int overlay_capture_base(Overlay *o)
 {
     int count = 0;
+    int input_count = 0;
     int ordering = 0;
     XRectangle *rects;
+    XRectangle *input_rects;
     Rect s;
 
     o->base = NULL;
     o->base_count = 0;
+    o->base_input = NULL;
+    o->base_input_count = 0;
     o->base_w = 0;
     o->base_h = 0;
     if (!win_rect(o->win, &s)) {
         return 0;
+    }
+    input_rects = XShapeGetRectangles(dpy, o->win, ShapeInput, &input_count,
+                                      &ordering);
+    if (input_rects != NULL && input_count > 0) {
+        o->base_input = input_rects;
+        o->base_input_count = input_count;
+    } else if (input_rects != NULL) {
+        XFree(input_rects);
     }
     rects = XShapeGetRectangles(dpy, o->win, ShapeBounding, &count, &ordering);
     if (rects == NULL || count <= 0) {
@@ -1515,6 +1646,9 @@ static void overlay_free(Overlay *o)
 {
     if (o->base != NULL) {
         XFree(o->base);
+    }
+    if (o->base_input != NULL) {
+        XFree(o->base_input);
     }
     if (o->applied != NULL) {
         XFree(o->applied);
@@ -1567,6 +1701,82 @@ static void classify(Target *t)
     t->ring_frame = None;
 }
 
+static void consider_overlay_candidate(Window win, unsigned int stack_index,
+                                       Rect *mains, int *frames, int *changed)
+{
+    Rect r;
+    int best = -1;
+    int best_score = 0;
+
+    if (!win_rect(win, &r)) {
+        return;
+    }
+    if (overlay_keep_known(win, &r)) {
+        return;
+    }
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        Target *t = &targets[i];
+        int score;
+
+        if (!t->valid || frames[i] < 0 || (int)stack_index < frames[i]) {
+            continue;
+        }
+        if (!overlay_candidate_ok(win, t, &mains[i], &r)) {
+            continue;
+        }
+        score = abs((r.x + r.w) - (mains[i].x + mains[i].w)) +
+                abs(r.y - mains[i].y);
+        if (best < 0 || score < best_score) {
+            best = i;
+            best_score = score;
+        }
+    }
+    if (best < 0) {
+        return;
+    }
+
+    Target *t = &targets[best];
+    int slot = -1;
+
+    for (int j = 0; j < t->overlay_count; j++) {
+        if (t->overlays[j].win == win) {
+            t->overlays[j].seen = 1;
+            slot = j;
+            break;
+        }
+    }
+    if (slot < 0 && t->overlay_count < MAX_OVERLAYS) {
+        Overlay *o = &t->overlays[t->overlay_count];
+        XWindowAttributes attr;
+
+        memset(o, 0, sizeof(*o));
+        o->win = win;
+        o->frame = win_top_level(win);
+        if (!XGetWindowAttributes(dpy, win, &attr)) {
+            memset(o, 0, sizeof(*o));
+            return;
+        }
+        o->managed = !attr.override_redirect;
+        int full_width_top = r.h <= OVERLAY_MAX_HEIGHT &&
+                             r.w >= mains[best].w - OVERLAY_SLACK &&
+                             abs(r.y - mains[best].y) <= 2;
+        o->click_through =
+            full_width_top &&
+            (o->managed || overlay_shape_exceeds_window(win, &r));
+        if (overlay_capture_base(o)) {
+            o->seen = 1;
+            t->overlay_count++;
+            *changed = 1;
+            XShapeSelectInput(dpy, win, ShapeNotifyMask);
+            logmsg("overlay %#lx of main %#lx (base rects=%d managed=%d "
+                   "click_through=%d)",
+                   win, t->main, o->base_count, o->managed, o->click_through);
+        } else {
+            memset(o, 0, sizeof(*o));
+        }
+    }
+}
+
 /*
  * Attach every chrome overlay window to the target it belongs to.  Called on
  * each scan; overlays that disappeared are dropped and the ones that are still
@@ -1602,64 +1812,38 @@ static void assign_overlays(void)
     }
 
     for (unsigned int k = 0; k < ntop; k++) {
-        Window win = top[k];
-        Rect r;
-        int best = -1;
-        int best_score = 0;
+        consider_overlay_candidate(top[k], k, mains, frames, &changed);
+    }
 
-        if (!win_rect(win, &r)) {
-            continue;
-        }
-        if (overlay_keep_known(win, &r)) {
-            continue;
-        }
-        for (int i = 0; i < MAX_TARGETS; i++) {
-            Target *t = &targets[i];
-            int score;
+    /*
+     * Override-redirect helpers are root children and were covered above.
+     * Managed helpers (newer Wine wraps the title bar shadow in a dialog) are
+     * clients inside a WM frame, so walk _NET_CLIENT_LIST instead of querying
+     * the children of every root window on the screen.
+     */
+    Atom type;
+    int format;
+    unsigned long count = 0, after = 0;
+    unsigned char *data = NULL;
 
-            if (!t->valid || frames[i] < 0 || (int)k < frames[i]) {
-                continue;
-            }
-            if (!overlay_candidate_ok(win, t, &mains[i], &r)) {
-                continue;
-            }
-            score = abs((r.x + r.w) - (mains[i].x + mains[i].w)) +
-                    abs(r.y - mains[i].y);
-            if (best < 0 || score < best_score) {
-                best = i;
-                best_score = score;
-            }
-        }
-        if (best < 0) {
-            continue;
-        }
+    if (XGetWindowProperty(dpy, root, atom_client_list, 0, 8192, False,
+                           XA_WINDOW, &type, &format, &count, &after,
+                           &data) == Success &&
+        data != NULL) {
+        Window *clients = (Window *)data;
 
-        Target *t = &targets[best];
-        int slot = -1;
+        for (unsigned long i = 0; i < count; i++) {
+            Window frame = win_top_level(clients[i]);
 
-        for (int j = 0; j < t->overlay_count; j++) {
-            if (t->overlays[j].win == win) {
-                t->overlays[j].seen = 1;
-                slot = j;
-                break;
+            for (unsigned int k = 0; k < ntop; k++) {
+                if (top[k] == frame) {
+                    consider_overlay_candidate(clients[i], k, mains, frames,
+                                               &changed);
+                    break;
+                }
             }
         }
-        if (slot < 0 && t->overlay_count < MAX_OVERLAYS) {
-            Overlay *o = &t->overlays[t->overlay_count];
-
-            memset(o, 0, sizeof(*o));
-            o->win = win;
-            if (overlay_capture_base(o)) {
-                o->seen = 1;
-                t->overlay_count++;
-                changed = 1;
-                XShapeSelectInput(dpy, win, ShapeNotifyMask);
-                logmsg("overlay %#lx of main %#lx (base rects=%d)", win,
-                       t->main, o->base_count);
-            } else {
-                memset(o, 0, sizeof(*o));
-            }
-        }
+        XFree(data);
     }
 
     for (int i = 0; i < MAX_TARGETS; i++) {
@@ -1948,7 +2132,8 @@ static void print_holes(void)
             if (!win_rect(t->overlays[k].win, &s)) {
                 continue;
             }
-            n = collect_occluders(t, &s, holes, MAX_HOLES);
+            n = collect_occluders(t, t->overlays[k].frame, &s, holes,
+                                  MAX_HOLES);
             printf("overlay=%#lx %dx%d+%d+%d holes=%d\n",
                    t->overlays[k].win, s.w, s.h, s.x, s.y, n);
             for (int j = 0; j < n; j++) {
