@@ -168,6 +168,7 @@ typedef struct {
     double stale_since_ms;
     double last_config_ms;
     unsigned long pid;
+    int hidden;
     int valid;
 } Target;
 
@@ -247,6 +248,41 @@ static int win_rect(Window win, Rect *out)
     out->w = (int)w;
     out->h = (int)h;
     return out->w > 0 && out->h > 0;
+}
+
+static int win_viewable(Window win)
+{
+    XWindowAttributes attr;
+
+    return win != None && XGetWindowAttributes(dpy, win, &attr) &&
+           attr.map_state == IsViewable;
+}
+
+/*
+ * Closing WeCom to the tray only unmaps its window stack; the owner is still
+ * alive.  The caption strip has to follow that state instead of being mapped
+ * back on our own, otherwise the "- [] X" buttons stay floating over the
+ * desktop after the window is gone.
+ */
+static int main_viewable(const Target *t)
+{
+    return win_viewable(t->main);
+}
+
+static void overlay_set_mapped(const Overlay *o, int mapped)
+{
+    XWindowAttributes attr;
+
+    if (!XGetWindowAttributes(dpy, o->win, &attr)) {
+        return;
+    }
+    if (mapped && attr.map_state != IsViewable) {
+        XMapWindow(dpy, o->win);
+        XFlush(dpy);
+    } else if (!mapped && attr.map_state == IsViewable) {
+        XUnmapWindow(dpy, o->win);
+        XFlush(dpy);
+    }
 }
 
 static unsigned long win_pid(Window win)
@@ -1049,6 +1085,10 @@ static void overlay_apply_shape(Target *t, Overlay *o)
     if (!win_rect(o->win, &s)) {
         return;
     }
+    if (!main_viewable(t)) {
+        overlay_set_mapped(o, 0);
+        return;
+    }
     if (o->base_w != s.w || o->base_h != s.h) {
         if (shape_matches_window(o->win, &s)) {
             overlay_capture_base(o);
@@ -1197,7 +1237,6 @@ static void overlay_restore(Target *t, Overlay *o)
     Rect s;
     XserverRegion region;
 
-    (void)t;
     if (!win_rect(o->win, &s)) {
         return;
     }
@@ -1211,7 +1250,9 @@ static void overlay_restore(Target *t, Overlay *o)
     }
     XFixesSetWindowShapeRegion(dpy, o->win, ShapeInput, 0, 0, region);
     XFixesDestroyRegion(dpy, region);
-    XMapWindow(dpy, o->win);
+    if (main_viewable(t)) {
+        XMapWindow(dpy, o->win);
+    }
     XFlush(dpy);
 }
 
@@ -2283,11 +2324,16 @@ static int collect_targets(Target *found, int max_found)
 
 static void forget_target(Target *t)
 {
+    int visible = main_viewable(t);
+
     if (t->valid) {
         logmsg("forget main %#lx", t->main);
     }
     ring_shape_drop(t, 1);
     for (int i = 0; i < t->overlay_count; i++) {
+        if (!visible) {
+            overlay_set_mapped(&t->overlays[i], 0);
+        }
         overlay_restore(t, &t->overlays[i]);
         overlay_free(&t->overlays[i]);
     }
@@ -2314,6 +2360,20 @@ static void scan(void)
             }
         }
         if (!seen) {
+            XWindowAttributes attr;
+
+            /*
+             * A hidden owner is not a dead one: closing WeCom to the tray
+             * only unmaps the window stack.  Keep the target attached so the
+             * caption strip is hidden and shown together with its owner
+             * instead of being re-created - and re-classified from pixels
+             * that a hidden window cannot show.
+             */
+            if (XGetWindowAttributes(dpy, targets[i].main, &attr)) {
+                targets[i].hidden = 1;
+                shape_dirty = 1;
+                continue;
+            }
             forget_target(&targets[i]);
         }
     }
@@ -2338,11 +2398,13 @@ static void scan(void)
             break;
         }
         int was_valid = slot->valid;
+        int was_hidden = was_valid && slot->hidden;
         slot->main = found[j].main;
         slot->frame = found[j].frame;
         slot->pid = found[j].pid;
         slot->valid = 1;
-        if (!was_valid) {
+        slot->hidden = 0;
+        if (!was_valid || was_hidden) {
             hot_until = now_ms() + HOT_WINDOW_MS;
             slot->last_config_ms = now_ms();
         }
@@ -2360,7 +2422,7 @@ static void scan(void)
 
 static void reconcile_geometry(Target *t)
 {
-    if (!t->valid) {
+    if (!t->valid || t->hidden) {
         return;
     }
     glue_ring(t);
@@ -2370,6 +2432,12 @@ static void reconcile_geometry(Target *t)
 static void reconcile_shape(Target *t)
 {
     if (!t->valid) {
+        return;
+    }
+    if (t->hidden) {
+        for (int i = 0; i < t->overlay_count; i++) {
+            overlay_set_mapped(&t->overlays[i], 0);
+        }
         return;
     }
     main_shape_reconcile(t);
