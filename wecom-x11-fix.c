@@ -338,6 +338,7 @@ static void handle_tray_activation(Window win)
     Target *only = NULL;
     int count = 0;
 
+    logmsg("tray activation request for %#lx (xembed=%d)", win, win_is_xembed(win));
     if (!win_is_xembed(win)) {
         return;
     }
@@ -347,18 +348,26 @@ static void handle_tray_activation(Window win)
      * for a normal window that happens to carry _XEMBED_INFO.
      */
     if (!win_rect(win, &r) || r.w > 64 || r.h > 64) {
+        logmsg("tray activation %#lx rejected: rect %dx%d", win, r.w, r.h);
         return;
     }
+    /*
+     * Only windows that are on screen right now are candidates.  A WeCom
+     * window that was closed stays tracked as hidden so its overlays keep
+     * following it, but counting it here makes the tray click ambiguous
+     * forever: one closed window would permanently block activation of the
+     * real main window.
+     */
     for (int i = 0; i < MAX_TARGETS; i++) {
-        if (targets[i].valid) {
-            only = &targets[i];
+        if (targets[i].valid && main_viewable(&targets[i])) {
+            if (only == NULL) {
+                only = &targets[i];
+            }
             count++;
         }
     }
-    if (count != 1 || only == NULL || win == only->main) {
-        return;
-    }
-    if (!main_viewable(only)) {
+    if (count == 0 || only == NULL || win == only->main) {
+        logmsg("tray activation %#lx rejected: visible targets=%d", win, count);
         return;
     }
     /*
