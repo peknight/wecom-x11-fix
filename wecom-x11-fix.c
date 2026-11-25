@@ -100,6 +100,7 @@ static const char *const wecom_names[] = {
 #define SHAPE_INTERVAL_MS 30.0
 #define SHAPE_WATCHDOG_MS 250.0
 #define SHAPE_ECHO_MS 150.0
+#define TRAY_ACTIVATE_DELAY_MS 250.0
 
 typedef struct {
     int x, y, w, h;
@@ -178,6 +179,8 @@ static int verbose;
 static volatile sig_atomic_t running = 1;
 static double hot_until;
 static int shape_dirty = 1;
+static Window pending_activate_win = None;
+static double pending_activate_at = 0.0;
 
 static Atom atom_wm_pid;
 static Atom atom_wm_state;
@@ -189,6 +192,8 @@ static Atom atom_wm_window_type_popup_menu;
 static Atom atom_wm_window_type_dropdown_menu;
 static Atom atom_wm_window_type_tooltip;
 static Atom atom_client_list;
+static Atom atom_net_active_window;
+static Atom atom_xembed_info;
 
 static Target targets[MAX_TARGETS];
 
@@ -283,6 +288,87 @@ static void overlay_set_mapped(const Overlay *o, int mapped)
         XUnmapWindow(dpy, o->win);
         XFlush(dpy);
     }
+}
+
+static int win_is_xembed(Window win)
+{
+    Atom type;
+    int format;
+    unsigned long count = 0, after = 0;
+    unsigned char *data = NULL;
+    int found = 0;
+
+    if (XGetWindowProperty(dpy, win, atom_xembed_info, 0, 2, False,
+                           AnyPropertyType, &type, &format, &count, &after,
+                           &data) == Success &&
+        data != NULL) {
+        found = 1;
+        XFree(data);
+    }
+    return found;
+}
+
+static void activate_window(Window win)
+{
+    XEvent ev;
+
+    memset(&ev, 0, sizeof(ev));
+    ev.xclient.type = ClientMessage;
+    ev.xclient.window = win;
+    ev.xclient.message_type = atom_net_active_window;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = 2; /* source: pager/toolbar */
+    ev.xclient.data.l[1] = CurrentTime;
+    ev.xclient.data.l[2] = None;
+    XSendEvent(dpy, root, False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+    XRaiseWindow(dpy, win);
+    XFlush(dpy);
+}
+
+/*
+ * A click on the WeCom tray icon makes Wine ask the window manager to
+ * activate the icon window itself - a 22x22 XEmbed window inside the panel -
+ * instead of the WeCom main window.  The main window therefore stays behind
+ * whatever covers it.  Redirect that request to the tracked main window.
+ */
+static void handle_tray_activation(Window win)
+{
+    Rect r;
+    Target *only = NULL;
+    int count = 0;
+
+    if (!win_is_xembed(win)) {
+        return;
+    }
+    /*
+     * Only the tiny XEmbed icon itself is redirected.  Other apps (Tencent
+     * Meeting, for one) also answer a tray click with an activation request
+     * for a normal window that happens to carry _XEMBED_INFO.
+     */
+    if (!win_rect(win, &r) || r.w > 64 || r.h > 64) {
+        return;
+    }
+    for (int i = 0; i < MAX_TARGETS; i++) {
+        if (targets[i].valid) {
+            only = &targets[i];
+            count++;
+        }
+    }
+    if (count != 1 || only == NULL || win == only->main) {
+        return;
+    }
+    if (!main_viewable(only)) {
+        return;
+    }
+    /*
+     * The request has to wait until xfwm4 has finished handling Wine's own
+     * (wrong) activation of the icon window.  Sent immediately, the manager
+     * drops it and the main window stays behind.
+     */
+    pending_activate_win = only->main;
+    pending_activate_at = now_ms() + TRAY_ACTIVATE_DELAY_MS;
+    logmsg("tray icon %#lx activated, raising main %#lx", win, only->main);
 }
 
 static unsigned long win_pid(Window win)
@@ -2593,6 +2679,8 @@ int main(int argc, char **argv)
     atom_wm_window_type_tooltip =
         XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_TOOLTIP", False);
     atom_client_list = XInternAtom(dpy, "_NET_CLIENT_LIST", False);
+    atom_net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
+    atom_xembed_info = XInternAtom(dpy, "_XEMBED_INFO", False);
 
     int shape_event, shape_error;
     if (!XShapeQueryExtension(dpy, &shape_event, &shape_error)) {
@@ -2644,6 +2732,10 @@ int main(int argc, char **argv)
                     next_scan = soon;
                 }
                 shape_dirty = 1;
+            } else if (ev.type == ClientMessage) {
+                if (ev.xclient.message_type == atom_net_active_window) {
+                    handle_tray_activation(ev.xclient.window);
+                }
             } else if (ev.type == ConfigureNotify ||
                        ev.type == CirculateNotify) {
                 shape_dirty = 1;
@@ -2686,6 +2778,16 @@ int main(int argc, char **argv)
         }
 
         double now = now_ms();
+        if (pending_activate_win != None && now >= pending_activate_at) {
+            Window win = pending_activate_win;
+            Rect r;
+
+            pending_activate_win = None;
+            if (win_rect(win, &r)) {
+                activate_window(win);
+                logmsg("tray activation: raised main %#lx", win);
+            }
+        }
         if (now >= next_scan) {
             scan();
             next_scan = now + SCAN_INTERVAL_MS;
