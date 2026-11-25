@@ -515,6 +515,47 @@ static int win_is_known_overlay(Window win)
     return 0;
 }
 
+/*
+ * Screen lockers keep full-screen override-redirect windows mapped while the
+ * screen is blanked.  They are above every application by design, so treating
+ * them as ordinary occluders makes the caption strip unmap itself while the
+ * screen is locked, then map again when the locker changes state.  Ignore
+ * them: the locker already covers the whole screen when it is visible.
+ */
+static int win_is_screen_locker(Window win)
+{
+    static const char *const classes[] = {
+        "xfce4-screensaver",
+        "xscreensaver",
+        "light-locker",
+        "gnome-screensaver",
+        "i3lock",
+        "swaylock",
+    };
+    XClassHint hint = {0};
+    int found = 0;
+
+    if (!XGetClassHint(dpy, win, &hint)) {
+        return 0;
+    }
+    for (size_t i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) {
+        if ((hint.res_name != NULL &&
+             strcasecmp(hint.res_name, classes[i]) == 0) ||
+            (hint.res_class != NULL &&
+             strcasecmp(hint.res_class, classes[i]) == 0)) {
+            found = 1;
+            break;
+        }
+    }
+    if (hint.res_name != NULL) {
+        XFree(hint.res_name);
+    }
+    if (hint.res_class != NULL) {
+        XFree(hint.res_class);
+    }
+    return found;
+}
+
 static Overlay *find_overlay(Window win)
 {
     for (int i = 0; i < MAX_TARGETS; i++) {
@@ -560,6 +601,21 @@ static int collect_occluders(Target *t, Window anchor, const Rect *rect,
             break;
         }
     }
+    /*
+     * A managed helper's frame is recreated by the window manager when the
+     * helper is unmapped.  The cached frame then no longer exists, and
+     * treating that as "nothing covers the helper" maps it straight back,
+     * which immediately recreates the frame and starts an unmap/map loop.
+     * Fall back to the stable owner frame so an occluded helper stays hidden.
+     */
+    if (anchor_index < 0 && anchor != t->frame) {
+        for (unsigned int i = 0; i < ntop; i++) {
+            if (top[i] == t->frame) {
+                anchor_index = (int)i;
+                break;
+            }
+        }
+    }
     if (anchor_index < 0) {
         if (top != NULL) {
             XFree(top);
@@ -569,7 +625,8 @@ static int collect_occluders(Target *t, Window anchor, const Rect *rect,
     for (unsigned int i = (unsigned int)anchor_index + 1; i < ntop; i++) {
         Window win = top[i];
 
-        if (win_is_known_overlay(win) || win == t->ring_frame) {
+        if (win_is_known_overlay(win) || win == t->ring_frame ||
+            win_is_screen_locker(win)) {
             continue;
         }
 
@@ -1195,6 +1252,18 @@ static void overlay_apply_shape(Target *t, Overlay *o)
             o->base_h = s.h;
         }
     }
+    /*
+     * xfwm4 reparents a managed helper into a new frame every time it is
+     * unmapped and mapped again.  Keep the frame current, but do not use the
+     * helper's own stacking position while it is unmapped: xfwm4 withdraws
+     * the frame and leaves the client at the top of the root stack, which
+     * makes an occluded helper look as if it were above its occluder.  Use
+     * the owner frame as the stable anchor in that state.
+     */
+    o->frame = win_top_level(o->win);
+    XWindowAttributes attr;
+    int viewable = XGetWindowAttributes(dpy, o->win, &attr) &&
+                   attr.map_state == IsViewable;
     region = overlay_base_region(o, &s);
     /*
      * Override-redirect helpers are raised above every other top-level, so
@@ -1203,8 +1272,8 @@ static void overlay_apply_shape(Target *t, Overlay *o)
      * have normal stacking and are clipped by the windows above their own
      * frame.
      */
-    if (o->managed) {
-        anchor = o->frame != None ? o->frame : win_top_level(o->win);
+    if (o->managed && viewable && o->frame != None && o->frame != o->win) {
+        anchor = o->frame;
     } else {
         anchor = t->frame;
     }
@@ -1221,9 +1290,6 @@ static void overlay_apply_shape(Target *t, Overlay *o)
     }
     int nwant = 0;
     XRectangle *want = XFixesFetchRegion(dpy, region, &nwant);
-    XWindowAttributes attr;
-    int viewable = XGetWindowAttributes(dpy, o->win, &attr) &&
-                   attr.map_state == IsViewable;
 
     if (want == NULL || nwant == 0) {
         /*
@@ -1693,6 +1759,17 @@ static void glue_overlays(Target *t)
         int dx, dy;
 
         if (!win_rect(o->win, &s)) {
+            continue;
+        }
+        XWindowAttributes attr;
+
+        /*
+         * An unmapped helper has no meaningful on-screen position.  Wine
+         * positions it again when it maps the helper, so do not move it here
+         * based on stale or transient coordinates.
+         */
+        if (!XGetWindowAttributes(dpy, o->win, &attr) ||
+            attr.map_state != IsViewable) {
             continue;
         }
         if (s.h > STRIP_MAX_HEIGHT) {
@@ -2241,6 +2318,7 @@ static void assign_overlays(void)
         for (int j = 0; j < t->overlay_count; j++) {
             XWindowAttributes oa;
 
+            t->overlays[j].frame = win_top_level(t->overlays[j].win);
             /*
              * A helper we unmapped because it was fully covered is still a
              * live window: keep tracking it so it can be mapped again when
@@ -2785,6 +2863,8 @@ int main(int argc, char **argv)
             pending_activate_win = None;
             if (win_rect(win, &r)) {
                 activate_window(win);
+                shape_dirty = 1;
+                hot_until = now_ms() + HOT_WINDOW_MS;
                 logmsg("tray activation: raised main %#lx", win);
             }
         }
